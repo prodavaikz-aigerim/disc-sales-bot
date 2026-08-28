@@ -8,9 +8,13 @@ DISC-тест психотипа продавца для Telegram.
 
 Как это работает технически:
 - python-telegram-bot (async, v21+), long polling (не нужен вебхук/домен)
-- Состояние теста каждого пользователя хранится в памяти процесса
-  (context.user_data). Это не сохраняется между перезапусками бота —
-  для теста из 20 вопросов, который проходят за 3-5 минут, этого достаточно.
+- Состояние теста и результаты каждого пользователя хранятся через
+  PicklePersistence (context.user_data) в файле PERSISTENCE_PATH —
+  переживает перезапуск процесса бота. На Railway/Heroku-подобных
+  платформах с эфемерной файловой системой это НЕ переживает передеплой
+  без подключённого постоянного диска (volume) — для этого нужно
+  подключить volume и указать PERSISTENCE_PATH внутри него, либо
+  впоследствии перейти на SQLite/внешнюю БД.
 - Все настройки (токен, ссылки, тексты кнопок) берутся из переменных
   окружения — см. .env.example
 """
@@ -26,6 +30,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    PicklePersistence,
 )
 
 logging.basicConfig(
@@ -43,6 +48,7 @@ CHANNEL_URL = os.environ.get("CHANNEL_URL", "https://t.me/your_channel")
 COURSE_URL = os.environ.get("COURSE_URL", "https://your-course-link.example")
 CHANNEL_BUTTON_TEXT = os.environ.get("CHANNEL_BUTTON_TEXT", "📣 Подписаться на канал")
 COURSE_BUTTON_TEXT = os.environ.get("COURSE_BUTTON_TEXT", "🎓 Записаться на обучение")
+PERSISTENCE_PATH = os.environ.get("PERSISTENCE_PATH", "bot_persistence.pickle")
 
 # --------------------------------------------------------------------------
 # ПСИХОТИПЫ DISC (цветовая модель Марстона)
@@ -366,8 +372,27 @@ async def send_question(update_or_query, context: ContextTypes.DEFAULT_TYPE, qin
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Если пользователь уже начинал тест, но не дошёл до конца (current_q
+    # задан и не None) — это значит, что предыдущий прогон прервался
+    # (например, бот перезапускался и его прогресс не сохранился).
+    # Явно предупреждаем об этом, а не тихо перезаписываем данные.
+    unfinished = context.user_data.get("current_q") is not None
+    already_has_result = context.user_data.get("disc_scores") is not None
+
     context.user_data["scores"] = {"R": 0, "Y": 0, "G": 0, "B": 0}
     context.user_data["current_q"] = 0
+
+    if unfinished:
+        await update.message.reply_text(
+            "⚠️ Похоже, твой предыдущий тест не был завершён и его результаты "
+            "не сохранились. Начинаем заново — отвечай на все вопросы, "
+            "чтобы получить результат."
+        )
+    elif already_has_result:
+        await update.message.reply_text(
+            "Ты уже проходила этот тест раньше. Если хочешь пройти заново — "
+            "предыдущий результат будет заменён новым."
+        )
 
     intro = (
         "Привет! 👋\n\n"
@@ -375,8 +400,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "(Красный / Жёлтый / Зелёный / Синий).\n\n"
         f"Тебя ждёт {TOTAL_QUESTIONS} вопросов, отвечай честно и быстро — "
         "первый вариант, который откликается, обычно самый точный.\n"
-        "В конце ты получишь свои 2 ведущих психотипа, а также свои "
-        "сильные стороны, зоны роста и рекомендации.\n\n"
+        "В конце ты узнаешь свои 2 ведущих психотипа.\n\n"
         "Погнали!"
     )
     await update.message.reply_text(intro)
@@ -404,7 +428,8 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if current_q is None or scores is None:
         await query.edit_message_text(
-            "Похоже, тест был сброшен. Нажми /start, чтобы начать заново."
+            "⚠️ Результаты предыдущего теста не сохранились (бот перезапускался). "
+            "Нажми /start, чтобы пройти заново."
         )
         return
 
@@ -423,6 +448,102 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def format_result_text(scores: dict) -> str:
+    """Бесплатный результат — законченный мини-разбор, но осознанно неполный.
+
+    Структура (по примеру, который утвердила Айгерим):
+      - профиль (2 ведущих психотипа + краткое связное описание)
+      - 1 зона риска (не полный список, только самая характерная)
+      - 1 главный совет (не полный список рекомендаций)
+      - явная рамка "это только 20% профиля"
+
+    Полный список "зон роста" и "рекомендаций" остаётся в PROFILES и
+    используется в format_full_result_text() — платной версии.
+    """
+    ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+    top1_code, _ = ranked[0]
+    top2_code, _ = ranked[1]
+
+    top1 = PROFILES[top1_code]
+    top2 = PROFILES[top2_code]
+
+    lines = []
+    lines.append("🎯 <b>Твой результат готов!</b>\n")
+    lines.append(
+        f"<b>Твой профиль: {top1['emoji']} {top1['name']} "
+        f"+ {top2['emoji']} {top2['name']}</b>\n"
+    )
+
+    # Краткое связное описание из "сильных сторон" обоих типов
+    summary = " ".join(
+        s.capitalize() + "."
+        for profile in (top1, top2)
+        for s in profile["strengths"][:1]
+    )
+    lines.append(summary)
+    lines.append("")
+
+    # 1 зона риска — берём первую (самую характерную) у ведущего типа
+    lines.append(f"<b>Твоя зона риска:</b> {top1['weaknesses'][0]}.")
+    lines.append("")
+
+    # 1 главный совет — берём первую рекомендацию у ведущего типа
+    lines.append(f"<b>Главный совет:</b> {top1['recommendations'][0]}.")
+    lines.append("")
+
+    lines.append(
+        "Помни: нет «плохих» и «хороших» психотипов — есть особенности, "
+        "которые можно использовать в свою пользу, если знать, как именно."
+    )
+    lines.append("")
+    lines.append("📊 Это только 20% твоего профиля.")
+
+    return "\n".join(lines)
+
+
+def format_cta_text() -> str:
+    """CTA-сообщение после бесплатного результата DISC.
+
+    Отдельная функция (не часть format_result_text), чтобы в show_result
+    можно было отправить её вторым сообщением — так бесплатный результат
+    и предложение купить визуально не сливаются в один блок.
+    """
+    lines = [
+        "Полный анализ покажет:",
+        "— Какой я продавец?",
+        "— Как я веду себя с клиентом?",
+        "— Что меня реально мотивирует?",
+        "— Почему я иногда теряю клиентов?",
+        "— Какой тип клиентов мне продавать легче?",
+        "— С какими клиентами возникают конфликты?",
+        "— Как мне адаптировать свою подачу?",
+        "— Что меня демотивирует в продажах?",
+        "— Как руководителю мной управлять?",
+        "— Как мне самому управлять своими продажами?",
+        "",
+        "💡 <b>Пример того, что ты узнаешь — твоё «слепое пятно» в продажах:</b>",
+        (
+            "Ты — продавец с сильным упором на результат. Из-за этого можешь "
+            "слишком быстро переходить к предложению, пока клиент ещё не "
+            "созрел и не увидел ценность. И теряешь тех, кого на самом деле "
+            "мог бы закрыть."
+        ),
+        "",
+        (
+            "Чтобы получить свой персональный профиль продавца — DISC + "
+            "мотиваторы вместе — пройди второй тест: что тебя реально "
+            "вдохновляет и двигает."
+        ),
+    ]
+    return "\n".join(lines)
+
+
+def format_full_result_text(scores: dict) -> str:
+    """Полный (платный) результат по DISC — зоны роста + рекомендации.
+
+    Пока нигде не вызывается в текущем сценарии /start. Оставлена для
+    следующего этапа: объединение с результатами теста на мотиваторы
+    в единый отчёт, открываемый после оплаты или команды /unlock.
+    """
     ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
     top1_code, top1_score = ranked[0]
     top2_code, top2_score = ranked[1]
@@ -431,7 +552,7 @@ def format_result_text(scores: dict) -> str:
     top2 = PROFILES[top2_code]
 
     lines = []
-    lines.append("🎯 <b>Твой результат готов!</b>\n")
+    lines.append("🎯 <b>Твой полный разбор</b>\n")
     lines.append("Баллы по психотипам:")
     for code, score in ranked:
         p = PROFILES[code]
@@ -443,7 +564,7 @@ def format_result_text(scores: dict) -> str:
         f"+ {top2['emoji']} {top2['name']}</b>\n"
     )
 
-    for label, profile in ((1, top1), (2, top2)):
+    for profile in (top1, top2):
         lines.append(f"{profile['emoji']} <b>{profile['name']} — {profile['subtitle']}</b>")
         lines.append("<u>Сильные стороны:</u>")
         for s in profile["strengths"]:
@@ -466,6 +587,7 @@ def format_result_text(scores: dict) -> str:
 
 async def show_result(query, context: ContextTypes.DEFAULT_TYPE, scores: dict):
     result_text = format_result_text(scores)
+    cta_text = format_cta_text()
 
     cta_buttons = InlineKeyboardMarkup(
         [
@@ -474,13 +596,19 @@ async def show_result(query, context: ContextTypes.DEFAULT_TYPE, scores: dict):
         ]
     )
 
+    # Результат и CTA — раздельными сообщениями, чтобы бесплатный разбор
+    # не сливался визуально с продающим блоком.
     await query.edit_message_text(
         result_text, parse_mode=ParseMode.HTML, reply_markup=None
     )
+    await query.message.reply_text(cta_text, parse_mode=ParseMode.HTML)
     await query.message.reply_text(
         "Что дальше? 👇", reply_markup=cta_buttons
     )
 
+    # Баллы DISC сохраняем (не обнуляем!) — понадобятся позже для полного
+    # платного отчёта, который объединит их с результатами теста на мотиваторы.
+    context.user_data["disc_scores"] = scores
     context.user_data["current_q"] = None
     context.user_data["scores"] = None
 
@@ -496,7 +624,8 @@ def main():
             "(токен из @BotFather) перед запуском."
         )
 
-    application = Application.builder().token(BOT_TOKEN).build()
+    persistence = PicklePersistence(filepath=PERSISTENCE_PATH)
+    application = Application.builder().token(BOT_TOKEN).persistence(persistence).build()
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
