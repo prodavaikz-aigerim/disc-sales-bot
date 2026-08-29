@@ -96,7 +96,7 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 # Название модели может со временем меняться — актуальные варианты
 # смотри в документации Anthropic (docs.anthropic.com), если этот
 # конкретный id перестанет работать.
-ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-5")
+ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 
 # Настройки почты для дублирования отчёта на email (SMTP). Если оставить
 # SMTP_HOST пустым — email просто не отправляется, отчёт уходит только в
@@ -923,8 +923,12 @@ def format_paid_offer_text() -> str:
         "Потому что недостаточно знать, КАК продавать.",
         "Нужно понимать: <b>КАК ИМЕННО ТЫ ПРОДАЁШЬ.</b>",
         "",
-        "Что тебя двигает. Как ты принимаешь решения. Как ты реагируешь на клиента.",
-        "Что даёт тебе энергию в продажах. Где ты сильна. А где сама себе создаёшь ограничения.",
+        "Что тебя двигает?",
+        "Как ты принимаешь решения?",
+        "Как ты реагируешь на клиента?",
+        "Что даёт тебе энергию в продажах?",
+        "Где ты силён(-а)?",
+        "А где сам(-а) создаёшь себе ограничения?",
         "",
         "💎 <b>В полном персональном разборе ты узнаешь:</b>",
         "1. Твой психотип — как ты проявляешь себя в продажах",
@@ -1294,17 +1298,19 @@ def build_report_prompt(disc_scores: dict, motivator_scores: dict) -> str:
     return prompt
 
 
-async def generate_full_report(disc_scores: dict, motivator_scores: dict) -> list:
+async def generate_full_report(disc_scores: dict, motivator_scores: dict):
     """Генерирует полный отчёт через Claude API.
 
-    Возвращает список из 15 строк (содержание каждого раздела, без
-    заголовков — заголовки добавляются отдельно, см. format_report_html).
-    При любой ошибке или если модель вернула не 15 частей — возвращает
-    None, и вызывающий код подставит фолбэк.
+    Возвращает кортеж (sections, error_reason):
+      - при успехе: (список из 15 строк содержания, None)
+      - при любой ошибке или если модель вернула не 15 частей:
+        (None, короткое текстовое описание причины) — вызывающий код
+        подставит фолбэк и покажет причину админу в статусе.
     """
     if not ANTHROPIC_API_KEY:
-        logger.warning("ANTHROPIC_API_KEY не задан — используется склеенный отчёт (фолбэк)")
-        return None
+        reason = "ANTHROPIC_API_KEY не задан"
+        logger.warning("%s — используется склеенный отчёт (фолбэк)", reason)
+        return None, reason
 
     prompt = build_report_prompt(disc_scores, motivator_scores)
 
@@ -1319,21 +1325,23 @@ async def generate_full_report(disc_scores: dict, motivator_scores: dict) -> lis
 
     try:
         raw_text = await asyncio.to_thread(_call)
-    except Exception:
+    except Exception as e:
+        reason = f"ошибка запроса к Claude API: {e}"
         logger.exception("Не удалось сгенерировать отчёт через Claude API — используется фолбэк")
-        return None
+        return None, reason
 
     sections = [part.strip() for part in raw_text.split(REPORT_SECTION_DELIMITER)]
 
     if len(sections) != len(REPORT_SECTION_TITLES):
+        reason = f"модель вернула {len(sections)} разделов вместо {len(REPORT_SECTION_TITLES)}"
         logger.warning(
             "Claude API вернул %s разделов вместо %s — используется фолбэк",
             len(sections),
             len(REPORT_SECTION_TITLES),
         )
-        return None
+        return None, reason
 
-    return sections
+    return sections, None
 
 
 def format_report_html(sections: list) -> str:
@@ -1393,7 +1401,7 @@ def format_academy_cta_text() -> str:
         "",
         (
             "🔥 Хочешь прямо сейчас закрыть своё главное возражение? "
-            "Пройди профессиональное обучение по продажам с отработкой "
+            "Пройди курс <b>«Профессиональный продавец»</b> с отработкой "
             "<b>30 возражений «Это дорого»</b> — его уже прошли "
             "<b>свыше 12 000 человек</b>. А дальше сможешь перейти на "
             "тариф «Продажи по психотипам клиента»."
@@ -1461,7 +1469,7 @@ async def handle_confirm_payment(update: Update, context: ContextTypes.DEFAULT_T
     # статических полных отчётов, чтобы клиент в любом случае получил
     # результат. И в том, и в другом случае итоговый текст — валидный HTML
     # (заголовки жирным мы добавляем сами, содержание экранировано).
-    sections = await generate_full_report(disc_scores, motivator_scores)
+    sections, error_reason = await generate_full_report(disc_scores, motivator_scores)
     used_fallback = sections is None
     if sections is None:
         report_text = (
@@ -1505,7 +1513,7 @@ async def handle_confirm_payment(update: Update, context: ContextTypes.DEFAULT_T
         + "</p><hr><p>"
         + academy_cta_html
         + f'</p><p><a href="{CHANNEL_URL}">Перейти в канал Академии продаж</a></p>'
-        + f'<p><a href="{COURSE_URL}">Пройти обучение по продажам (30 возражений «Это дорого»)</a></p>'
+        + f'<p><a href="{COURSE_URL}">Пройти курс «Профессиональный продавец» (30 возражений «Это дорого»)</a></p>'
     )
     email_ok = send_report_email(
         record["email"], "Твой полный профиль продавца", html_body
@@ -1515,7 +1523,7 @@ async def handle_confirm_payment(update: Update, context: ContextTypes.DEFAULT_T
     status_lines.append(f"Telegram: {'ok' if telegram_ok else '⚠️ не доставлено (бот заблокирован?)'}")
     status_lines.append(f"Email ({record['email']}): {'ok' if email_ok else '⚠️ не отправлен'}")
     if used_fallback:
-        status_lines.append("⚠️ Отправлена склеенная версия (Claude API недоступен/не настроен)")
+        status_lines.append(f"⚠️ Отправлена склеенная версия ({error_reason})")
     await edit_admin_message(query, "\n".join(status_lines))
 
 
