@@ -22,15 +22,22 @@ DISC-тест психотипа продавца для Telegram.
 import logging
 import os
 import random
+import re
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
+from telegram.error import TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
     PicklePersistence,
+    filters,
 )
 
 logging.basicConfig(
@@ -50,14 +57,42 @@ CHANNEL_BUTTON_TEXT = os.environ.get("CHANNEL_BUTTON_TEXT", "📣 Подписа
 COURSE_BUTTON_TEXT = os.environ.get("COURSE_BUTTON_TEXT", "🎓 Записаться на обучение")
 PERSISTENCE_PATH = os.environ.get("PERSISTENCE_PATH", "bot_persistence.pickle")
 
-# Финальный платный оффер (полный профиль DISC + код мотивации). Пока без
-# автоматической оплаты — ADMIN_CONTACT_URL ведёт на личку/канал для связи;
-# если не задан, бот просто попросит написать в личные сообщения.
+# Финальный платный оффер (полный профиль психотипа + код мотивации).
+# Полуручной режим (пока не подключён официальный эквайринг Kaspi):
+# пользователь оставляет email → тебе приходит уведомление с кнопкой
+# подтверждения → после нажатия бот сам присылает полный отчёт в Telegram
+# и дублирует его на email.
 FULL_REPORT_PRICE = os.environ.get("FULL_REPORT_PRICE", "[цена уточняется]")
-ADMIN_CONTACT_URL = os.environ.get("ADMIN_CONTACT_URL", "")
 FULL_REPORT_BUTTON_TEXT = os.environ.get(
     "FULL_REPORT_BUTTON_TEXT", "💎 Получить мой полный профиль"
 )
+
+# Ссылка на оплату (например, ссылка "удалённая оплата" из Kaspi Pay) —
+# показывается пользователю сразу после того, как он оставил email, ДО
+# уведомления админу. Если оставить пустым — вместо кнопки со ссылкой
+# покажется номер телефона для перевода (KASPI_PHONE_NUMBER), а если и он
+# пуст — просто попросим подождать реквизиты от админа лично.
+PAYMENT_LINK_URL = os.environ.get("PAYMENT_LINK_URL", "")
+KASPI_PHONE_NUMBER = os.environ.get("KASPI_PHONE_NUMBER", "")
+PAYMENT_BUTTON_TEXT = os.environ.get("PAYMENT_BUTTON_TEXT", "💳 Оплатить")
+
+# Твой личный Telegram chat_id (не username!) — сюда будут приходить
+# уведомления. Узнать свой chat_id можно, написав боту @userinfobot.
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "")
+
+# Необязательно: твой Telegram username (без @) — если задать, после
+# отправки чека пользователь увидит ссылку написать тебе лично напрямую.
+ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "")
+
+# Настройки почты для дублирования отчёта на email (SMTP). Если оставить
+# SMTP_HOST пустым — email просто не отправляется, отчёт уходит только в
+# Telegram, без ошибок и без блокировки процесса подтверждения.
+SMTP_HOST = os.environ.get("SMTP_HOST", "")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USER = os.environ.get("SMTP_USER", "")
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
+SMTP_FROM_EMAIL = os.environ.get("SMTP_FROM_EMAIL", SMTP_USER)
+SMTP_FROM_NAME = os.environ.get("SMTP_FROM_NAME", "Психотип продавца")
 
 # --------------------------------------------------------------------------
 # ПСИХОТИПЫ DISC (цветовая модель Марстона)
@@ -864,7 +899,7 @@ async def show_motivator_result(query, context: ContextTypes.DEFAULT_TYPE, score
     await query.edit_message_text(result_text, parse_mode=ParseMode.HTML, reply_markup=None)
 
     # Блок "соединения" — только если есть оба результата (обычный порядок
-    # прохождения). Если DISC-баллы почему-то отсутствуют (например,
+    # прохождения). Если психотип-баллы почему-то отсутствуют (например,
     # прогресс потерялся при перезапуске бота), пропускаем синтез и сразу
     # предлагаем полный оффер — так пользователь не застревает без ответа.
     if disc_scores is not None:
@@ -872,25 +907,290 @@ async def show_motivator_result(query, context: ContextTypes.DEFAULT_TYPE, score
         await query.message.reply_text(synthesis_text, parse_mode=ParseMode.HTML)
 
     offer_text = format_paid_offer_text()
-
-    if ADMIN_CONTACT_URL:
-        offer_buttons = InlineKeyboardMarkup(
-            [[InlineKeyboardButton(FULL_REPORT_BUTTON_TEXT, url=ADMIN_CONTACT_URL)]]
-        )
-        await query.message.reply_text(
-            offer_text, parse_mode=ParseMode.HTML, reply_markup=offer_buttons
-        )
-    else:
-        await query.message.reply_text(
-            offer_text + "\n\n👉 Напиши мне в личные сообщения, чтобы получить полный разбор.",
-            parse_mode=ParseMode.HTML,
-        )
+    offer_buttons = InlineKeyboardMarkup(
+        [[InlineKeyboardButton(FULL_REPORT_BUTTON_TEXT, callback_data="request_report")]]
+    )
+    await query.message.reply_text(
+        offer_text, parse_mode=ParseMode.HTML, reply_markup=offer_buttons
+    )
 
     # Баллы мотиваторов сохраняем — понадобятся для полного платного отчёта
     # вместе с disc_scores (см. format_full_result_text / format_motivator_full_text).
     context.user_data["motivator_scores"] = scores
     context.user_data["m_current_q"] = None
     context.user_data["m_scores"] = None
+
+
+# --------------------------------------------------------------------------
+# ПОЛУРУЧНОЙ РЕЖИМ ОПЛАТЫ: заявка на email → уведомление админу → подтверждение
+#
+# Пока не подключён официальный эквайринг Kaspi, процесс такой:
+#   1) пользователь жмёт "Получить мой полный профиль" → бот просит email
+#   2) после email заявка (баллы + email + контакт) уходит админу в личку
+#      (ADMIN_CHAT_ID) с кнопкой подтверждения
+#   3) админ вручную сверяет оплату и жмёт кнопку → бот сам отправляет
+#      полный отчёт пользователю в Telegram и дублирует его на email
+# --------------------------------------------------------------------------
+
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def is_valid_email(text: str) -> bool:
+    return bool(EMAIL_RE.match(text.strip()))
+
+
+def send_report_email(to_email: str, subject: str, html_body: str) -> bool:
+    """Отправляет отчёт на email через SMTP. Возвращает True/False.
+
+    Если SMTP не настроен (SMTP_HOST пуст) — ничего не делает и возвращает
+    False, не поднимая исключение: email тут не критичен, отчёт всё равно
+    уходит в Telegram.
+    """
+    if not SMTP_HOST or not SMTP_USER or not SMTP_PASSWORD:
+        logger.info("SMTP не настроен — email не отправлен (%s)", to_email)
+        return False
+
+    try:
+        message = MIMEMultipart("alternative")
+        message["Subject"] = subject
+        message["From"] = f"{SMTP_FROM_NAME} <{SMTP_FROM_EMAIL}>"
+        message["To"] = to_email
+        message.attach(MIMEText(html_body, "html", "utf-8"))
+
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.sendmail(SMTP_FROM_EMAIL, [to_email], message.as_string())
+        return True
+    except Exception:
+        logger.exception("Не удалось отправить email на %s", to_email)
+        return False
+
+
+async def send_payment_instructions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает пользователю, куда и сколько платить, и просит прислать скриншот чека сюда же.
+
+    Приоритет: ссылка на оплату (PAYMENT_LINK_URL, например "удалённая
+    оплата" из Kaspi Pay) → номер телефона для перевода (KASPI_PHONE_NUMBER)
+    → если ничего не настроено, просто просим подождать реквизиты лично.
+    """
+    ask_receipt = (
+        "\n\nПосле оплаты пришли сюда скриншот чека (просто фото) — я "
+        "проверю его и вышлю тебе полный разбор."
+    )
+
+    if PAYMENT_LINK_URL:
+        text = f"💳 Стоимость: {FULL_REPORT_PRICE}{ask_receipt}"
+        buttons = InlineKeyboardMarkup(
+            [[InlineKeyboardButton(PAYMENT_BUTTON_TEXT, url=PAYMENT_LINK_URL)]]
+        )
+        await update.message.reply_text(text, reply_markup=buttons)
+    elif KASPI_PHONE_NUMBER:
+        text = (
+            f"💳 Стоимость: {FULL_REPORT_PRICE}\n\n"
+            f"Переведи через Kaspi Pay на номер: <b>{KASPI_PHONE_NUMBER}</b>"
+            f"{ask_receipt}"
+        )
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+    else:
+        await update.message.reply_text(
+            f"💳 Стоимость: {FULL_REPORT_PRICE}\n\n"
+            "Реквизиты для оплаты пришлю тебе лично в течение дня."
+            f"{ask_receipt}"
+        )
+
+    context.user_data["awaiting_receipt"] = True
+
+
+async def request_full_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if context.user_data.get("disc_scores") is None or context.user_data.get(
+        "motivator_scores"
+    ) is None:
+        await query.message.reply_text(
+            "⚠️ Похоже, не все результаты сохранились. Пройди /start и оба "
+            "теста заново, чтобы запросить полный профиль."
+        )
+        return
+
+    context.user_data["awaiting_email"] = True
+    await query.message.reply_text(
+        "Напиши свою электронную почту — как только оплата будет "
+        "подтверждена, отчёт придёт сюда и на неё."
+    )
+
+
+async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ловит обычные текстовые сообщения — сейчас нужен только email-адрес.
+
+    Если пользователь не в процессе оставления email (awaiting_email не
+    выставлен), просто ничего не делаем — этот бот не рассчитан на
+    произвольный диалог вне сценария теста.
+    """
+    if not context.user_data.get("awaiting_email"):
+        return
+
+    email = update.message.text.strip()
+    if not is_valid_email(email):
+        await update.message.reply_text(
+            "Это не похоже на email. Проверь формат (например, name@example.com) "
+            "и пришли ещё раз."
+        )
+        return
+
+    context.user_data["awaiting_email"] = False
+    context.user_data["email"] = email
+
+    await update.message.reply_text("Спасибо! Вот как оплатить:")
+    await send_payment_instructions(update, context)
+
+
+async def handle_receipt_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ловит фото — если пользователь ждёт отправки чека, пересылаем его админу.
+
+    Если фото пришло не в рамках ожидания чека (awaiting_receipt не
+    выставлен), ничего не делаем — бот не разбирает произвольные фото.
+    """
+    if not context.user_data.get("awaiting_receipt"):
+        return
+
+    context.user_data["awaiting_receipt"] = False
+
+    user = update.effective_user
+    email = context.user_data.get("email", "")
+    receipt_file_id = update.message.photo[-1].file_id
+
+    pending = context.bot_data.setdefault("pending", {})
+    pending[str(user.id)] = {
+        "disc_scores": context.user_data.get("disc_scores"),
+        "motivator_scores": context.user_data.get("motivator_scores"),
+        "email": email,
+        "username": user.username,
+        "full_name": user.full_name,
+        "receipt_file_id": receipt_file_id,
+    }
+
+    followup = "Спасибо! Проверю оплату и пришлю тебе полный разбор — сюда и на почту."
+    if ADMIN_USERNAME:
+        followup += f"\n\nЕсли хочешь ускорить — можешь также написать мне лично: https://t.me/{ADMIN_USERNAME}"
+    await update.message.reply_text(followup)
+
+    if not ADMIN_CHAT_ID:
+        logger.warning(
+            "ADMIN_CHAT_ID не задан — заявка от %s сохранена, но уведомление не отправлено",
+            user.id,
+        )
+        return
+
+    contact = f"@{user.username}" if user.username else user.full_name
+    caption = (
+        "🔔 Новая заявка на полный профиль\n\n"
+        f"Пользователь: {contact} (id {user.id})\n"
+        f"Email: {email}\n\n"
+        "Проверь чек и нажми кнопку, чтобы отправить отчёт."
+    )
+    confirm_button = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("✅ Подтвердить и отправить", callback_data=f"confirm|{user.id}")]]
+    )
+    try:
+        await context.bot.send_photo(
+            chat_id=ADMIN_CHAT_ID,
+            photo=receipt_file_id,
+            caption=caption,
+            reply_markup=confirm_button,
+        )
+    except TelegramError:
+        logger.exception("Не удалось отправить уведомление админу о заявке %s", user.id)
+
+
+async def handle_confirm_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+
+    if ADMIN_CHAT_ID and str(query.message.chat.id) != str(ADMIN_CHAT_ID):
+        await query.answer(text="Недостаточно прав", show_alert=True)
+        return
+
+    await query.answer()
+
+    try:
+        _, target_id_str = query.data.split("|")
+    except ValueError:
+        return
+
+    pending = context.bot_data.get("pending", {})
+    record = pending.pop(target_id_str, None)
+
+    if record is None:
+        await edit_admin_message(query, "⚠️ Заявка не найдена — возможно, уже обработана.")
+        return
+
+    target_id = int(target_id_str)
+    disc_text = format_full_result_text(record["disc_scores"])
+    motivator_text = format_motivator_full_text(record["motivator_scores"])
+
+    telegram_ok = True
+    try:
+        await context.bot.send_message(
+            chat_id=target_id,
+            text="🎉 Оплата подтверждена! Вот твой полный профиль продавца.",
+        )
+        await context.bot.send_message(
+            chat_id=target_id, text=disc_text, parse_mode=ParseMode.HTML
+        )
+        await context.bot.send_message(
+            chat_id=target_id, text=motivator_text, parse_mode=ParseMode.HTML
+        )
+    except TelegramError:
+        logger.exception("Не удалось отправить отчёт пользователю %s в Telegram", target_id)
+        telegram_ok = False
+
+    html_body = (
+        "<h2>Твой полный профиль продавца</h2>"
+        + "<p>" + disc_text.replace("\n", "<br>") + "</p>"
+        + "<p>" + motivator_text.replace("\n", "<br>") + "</p>"
+    )
+    email_ok = send_report_email(
+        record["email"], "Твой полный профиль продавца", html_body
+    )
+
+    status_lines = [f"✅ Отправлено: {record.get('username') or record.get('full_name') or target_id}"]
+    status_lines.append(f"Telegram: {'ok' if telegram_ok else '⚠️ не доставлено (бот заблокирован?)'}")
+    status_lines.append(f"Email ({record['email']}): {'ok' if email_ok else '⚠️ не отправлен'}")
+    await edit_admin_message(query, "\n".join(status_lines))
+
+
+async def edit_admin_message(query, new_text: str):
+    """Правит сообщение админу после подтверждения — фото (с подписью) или обычный текст."""
+    if query.message.photo:
+        await query.edit_message_caption(caption=new_text)
+    else:
+        await query.edit_message_text(new_text)
+
+
+async def pending_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Список заявок, ожидающих подтверждения — на случай, если пропустила уведомление."""
+    if ADMIN_CHAT_ID and str(update.effective_chat.id) != str(ADMIN_CHAT_ID):
+        return
+
+    pending = context.bot_data.get("pending", {})
+    if not pending:
+        await update.message.reply_text("Нет заявок, ожидающих подтверждения.")
+        return
+
+    for uid, record in pending.items():
+        contact = f"@{record['username']}" if record.get("username") else record.get("full_name", uid)
+        button = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("✅ Подтвердить и отправить", callback_data=f"confirm|{uid}")]]
+        )
+        caption = f"{contact} — {record['email']}"
+        if record.get("receipt_file_id"):
+            await update.message.reply_photo(
+                photo=record["receipt_file_id"], caption=caption, reply_markup=button
+            )
+        else:
+            await update.message.reply_text(caption, reply_markup=button)
 
 
 def format_result_text(scores: dict) -> str:
@@ -1060,9 +1360,14 @@ def main():
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("pending", pending_command))
     application.add_handler(CallbackQueryHandler(handle_answer, pattern=r"^ans\|"))
     application.add_handler(CallbackQueryHandler(start_motivators, pattern=r"^start_motivators$"))
     application.add_handler(CallbackQueryHandler(handle_motivator_answer, pattern=r"^manswer\|"))
+    application.add_handler(CallbackQueryHandler(request_full_report, pattern=r"^request_report$"))
+    application.add_handler(CallbackQueryHandler(handle_confirm_payment, pattern=r"^confirm\|"))
+    application.add_handler(MessageHandler(filters.PHOTO, handle_receipt_photo))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
     application.add_error_handler(on_error)
 
     logger.info("Бот запущен, ждём сообщения...")
