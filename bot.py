@@ -24,10 +24,6 @@ import html
 import logging
 import os
 import random
-import re
-import smtplib
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 
 import anthropic
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -62,16 +58,16 @@ PERSISTENCE_PATH = os.environ.get("PERSISTENCE_PATH", "bot_persistence.pickle")
 
 # Финальный платный оффер (полный профиль психотипа + код мотивации).
 # Полуручной режим (пока не подключён официальный эквайринг Kaspi):
-# пользователь оставляет email → тебе приходит уведомление с кнопкой
-# подтверждения → после нажатия бот сам присылает полный отчёт в Telegram
-# и дублирует его на email.
+# пользователь оставляет чек прямо в чате с ботом → тебе приходит
+# уведомление с кнопкой подтверждения → после нажатия бот сам присылает
+# полный отчёт в Telegram.
 FULL_REPORT_PRICE = os.environ.get("FULL_REPORT_PRICE", "[цена уточняется]")
 FULL_REPORT_BUTTON_TEXT = os.environ.get(
     "FULL_REPORT_BUTTON_TEXT", "💎 Получить мой полный профиль"
 )
 
 # Ссылка на оплату (например, ссылка "удалённая оплата" из Kaspi Pay) —
-# показывается пользователю сразу после того, как он оставил email, ДО
+# показывается пользователю сразу после нажатия кнопки выше, до
 # уведомления админу. Если оставить пустым — вместо кнопки со ссылкой
 # покажется номер телефона для перевода (KASPI_PHONE_NUMBER), а если и он
 # пуст — просто попросим подождать реквизиты от админа лично.
@@ -97,16 +93,6 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 # смотри в документации Anthropic (docs.anthropic.com), если этот
 # конкретный id перестанет работать.
 ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
-
-# Настройки почты для дублирования отчёта на email (SMTP). Если оставить
-# SMTP_HOST пустым — email просто не отправляется, отчёт уходит только в
-# Telegram, без ошибок и без блокировки процесса подтверждения.
-SMTP_HOST = os.environ.get("SMTP_HOST", "")
-SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
-SMTP_USER = os.environ.get("SMTP_USER", "")
-SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
-SMTP_FROM_EMAIL = os.environ.get("SMTP_FROM_EMAIL", SMTP_USER)
-SMTP_FROM_NAME = os.environ.get("SMTP_FROM_NAME", "Психотип продавца")
 
 # --------------------------------------------------------------------------
 # ПСИХОТИПЫ DISC (цветовая модель Марстона)
@@ -419,7 +405,7 @@ MOTIVATOR_PROFILES = {
     "T": {
         "name": "Развития",
         "emoji": "🧠",
-        "subtitle": "Мне важно становиться сильнее и знать больше",
+        "subtitle": "Тебе важно становиться сильнее и знать больше",
         "teaser": (
             "Тебя двигает вперёд любопытство и желание разобраться в сути — "
             "не поверхностно, а по-настоящему."
@@ -428,17 +414,17 @@ MOTIVATOR_PROFILES = {
     "U": {
         "name": "Результата",
         "emoji": "💰",
-        "subtitle": "Мне важно видеть деньги и конкретную отдачу",
+        "subtitle": "Тебе важно видеть деньги и конкретную отдачу",
         "teaser": (
             "Тебе важно видеть конкретную отдачу от своих усилий. Просто "
             "«интересная работа» тебя надолго не удержит — тебе нужно "
-            "понимать: что я получу, какой будет результат."
+            "понимать: что ты получишь, каким будет результат."
         ),
     },
     "A": {
         "name": "Гармонии",
         "emoji": "✨",
-        "subtitle": "Мне важно, чтобы работа приносила удовольствие, красоту и баланс",
+        "subtitle": "Тебе важно, чтобы работа приносила удовольствие, красоту и баланс",
         "teaser": (
             "Тебе важно не только ЧТО сделано, но и КАК — форма, атмосфера "
             "и гармония процесса имеют для тебя реальное значение."
@@ -447,7 +433,7 @@ MOTIVATOR_PROFILES = {
     "S": {
         "name": "Пользы",
         "emoji": "❤️",
-        "subtitle": "Мне важно помогать людям и видеть смысл в том, что я делаю",
+        "subtitle": "Тебе важно помогать людям и видеть смысл в том, что ты делаешь",
         "teaser": (
             "Тебя мотивирует ощущение, что твоя работа реально помогает "
             "людям, а не только приносит прибыль."
@@ -456,7 +442,7 @@ MOTIVATOR_PROFILES = {
     "I": {
         "name": "Свободы",
         "emoji": "👑",
-        "subtitle": "Мне важно самому принимать решения, иметь влияние и чувствовать свою силу",
+        "subtitle": "Тебе важно самому принимать решения, иметь влияние и чувствовать свою силу",
         "teaser": (
             "Тебе важно не просто заработать — тебе важно самому решать, "
             "как, с кем и куда двигаться. Жёсткий контроль и работа «по "
@@ -466,7 +452,7 @@ MOTIVATOR_PROFILES = {
     "TR": {
         "name": "Принципов",
         "emoji": "⚖️",
-        "subtitle": "Мне важно работать по своим ценностям, правилам и системе",
+        "subtitle": "Тебе важно работать по своим ценностям, правилам и системе",
         "teaser": (
             "Тебе комфортнее и эффективнее работается, когда есть чёткая "
             "система и понятные принципы, а не хаос и импровизация."
@@ -1002,52 +988,18 @@ async def show_motivator_result(query, context: ContextTypes.DEFAULT_TYPE, score
 
 
 # --------------------------------------------------------------------------
-# ПОЛУРУЧНОЙ РЕЖИМ ОПЛАТЫ: заявка на email → уведомление админу → подтверждение
+# ПОЛУРУЧНОЙ РЕЖИМ ОПЛАТЫ: заявка → уведомление админу → подтверждение
 #
 # Пока не подключён официальный эквайринг Kaspi, процесс такой:
-#   1) пользователь жмёт "Получить мой полный профиль" → бот просит email
-#   2) после email заявка (баллы + email + контакт) уходит админу в личку
-#      (ADMIN_CHAT_ID) с кнопкой подтверждения
+#   1) пользователь жмёт "Получить мой полный профиль" → бот сразу
+#      показывает, куда и сколько платить, и просит прислать скриншот чека
+#   2) чек уходит админу в личку (ADMIN_CHAT_ID) с кнопкой подтверждения
 #   3) админ вручную сверяет оплату и жмёт кнопку → бот сам отправляет
-#      полный отчёт пользователю в Telegram и дублирует его на email
+#      полный отчёт пользователю в Telegram
 # --------------------------------------------------------------------------
 
-EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
-
-def is_valid_email(text: str) -> bool:
-    return bool(EMAIL_RE.match(text.strip()))
-
-
-def send_report_email(to_email: str, subject: str, html_body: str) -> bool:
-    """Отправляет отчёт на email через SMTP. Возвращает True/False.
-
-    Если SMTP не настроен (SMTP_HOST пуст) — ничего не делает и возвращает
-    False, не поднимая исключение: email тут не критичен, отчёт всё равно
-    уходит в Telegram.
-    """
-    if not SMTP_HOST or not SMTP_USER or not SMTP_PASSWORD:
-        logger.info("SMTP не настроен — email не отправлен (%s)", to_email)
-        return False
-
-    try:
-        message = MIMEMultipart("alternative")
-        message["Subject"] = subject
-        message["From"] = f"{SMTP_FROM_NAME} <{SMTP_FROM_EMAIL}>"
-        message["To"] = to_email
-        message.attach(MIMEText(html_body, "html", "utf-8"))
-
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
-            server.starttls()
-            server.login(SMTP_USER, SMTP_PASSWORD)
-            server.sendmail(SMTP_FROM_EMAIL, [to_email], message.as_string())
-        return True
-    except Exception:
-        logger.exception("Не удалось отправить email на %s", to_email)
-        return False
-
-
-async def send_payment_instructions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def send_payment_instructions(query, context: ContextTypes.DEFAULT_TYPE):
     """Показывает пользователю, куда и сколько платить, и просит прислать скриншот чека сюда же.
 
     Приоритет: ссылка на оплату (PAYMENT_LINK_URL, например "удалённая
@@ -1064,16 +1016,16 @@ async def send_payment_instructions(update: Update, context: ContextTypes.DEFAUL
         buttons = InlineKeyboardMarkup(
             [[InlineKeyboardButton(PAYMENT_BUTTON_TEXT, url=PAYMENT_LINK_URL)]]
         )
-        await update.message.reply_text(text, reply_markup=buttons)
+        await query.message.reply_text(text, reply_markup=buttons)
     elif KASPI_PHONE_NUMBER:
         text = (
             f"💳 Стоимость: {FULL_REPORT_PRICE}\n\n"
             f"Переведи через Kaspi Pay на номер: <b>{KASPI_PHONE_NUMBER}</b>"
             f"{ask_receipt}"
         )
-        await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+        await query.message.reply_text(text, parse_mode=ParseMode.HTML)
     else:
-        await update.message.reply_text(
+        await query.message.reply_text(
             f"💳 Стоимость: {FULL_REPORT_PRICE}\n\n"
             "Реквизиты для оплаты пришлю тебе лично в течение дня."
             f"{ask_receipt}"
@@ -1095,36 +1047,7 @@ async def request_full_report(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return
 
-    context.user_data["awaiting_email"] = True
-    await query.message.reply_text(
-        "Напиши свою электронную почту — как только оплата будет "
-        "подтверждена, отчёт придёт сюда и на неё."
-    )
-
-
-async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ловит обычные текстовые сообщения — сейчас нужен только email-адрес.
-
-    Если пользователь не в процессе оставления email (awaiting_email не
-    выставлен), просто ничего не делаем — этот бот не рассчитан на
-    произвольный диалог вне сценария теста.
-    """
-    if not context.user_data.get("awaiting_email"):
-        return
-
-    email = update.message.text.strip()
-    if not is_valid_email(email):
-        await update.message.reply_text(
-            "Это не похоже на email. Проверь формат (например, name@example.com) "
-            "и пришли ещё раз."
-        )
-        return
-
-    context.user_data["awaiting_email"] = False
-    context.user_data["email"] = email
-
-    await update.message.reply_text("Спасибо! Вот как оплатить:")
-    await send_payment_instructions(update, context)
+    await send_payment_instructions(query, context)
 
 
 async def process_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE, file_id: str, is_photo: bool):
@@ -1137,20 +1060,18 @@ async def process_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE, fi
     context.user_data["awaiting_receipt"] = False
 
     user = update.effective_user
-    email = context.user_data.get("email", "")
 
     pending = context.bot_data.setdefault("pending", {})
     pending[str(user.id)] = {
         "disc_scores": context.user_data.get("disc_scores"),
         "motivator_scores": context.user_data.get("motivator_scores"),
-        "email": email,
         "username": user.username,
         "full_name": user.full_name,
         "receipt_file_id": file_id,
         "receipt_is_photo": is_photo,
     }
 
-    followup = "Спасибо! Проверю оплату и пришлю тебе полный разбор — сюда и на почту."
+    followup = "Спасибо! Проверю оплату и пришлю тебе полный разбор сюда."
     if ADMIN_USERNAME:
         followup += f"\n\nЕсли хочешь ускорить — можешь также написать мне лично: https://t.me/{ADMIN_USERNAME}"
     await update.message.reply_text(followup)
@@ -1165,8 +1086,7 @@ async def process_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE, fi
     contact = f"@{user.username}" if user.username else user.full_name
     caption = (
         "🔔 Новая заявка на полный профиль\n\n"
-        f"Пользователь: {contact} (id {user.id})\n"
-        f"Email: {email}\n\n"
+        f"Пользователь: {contact} (id {user.id})\n\n"
         "Проверь чек и нажми кнопку, чтобы отправить отчёт."
     )
     confirm_button = InlineKeyboardMarkup(
@@ -1315,7 +1235,7 @@ async def generate_full_report(disc_scores: dict, motivator_scores: dict):
     prompt = build_report_prompt(disc_scores, motivator_scores)
 
     def _call():
-        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=45.0)
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=120.0)
         response = client.messages.create(
             model=ANTHROPIC_MODEL,
             max_tokens=4096,
@@ -1358,7 +1278,7 @@ def format_report_html(sections: list) -> str:
 
 def format_academy_cta_text() -> str:
     """Нативная реклама Академии продаж — отправляется отдельным сообщением
-    сразу после полного отчёта (и в Telegram, и добавляется в email).
+    сразу после полного отчёта в Telegram.
 
     Сознательно не ссылается на конкретные номера пунктов отчёта (типа
     "см. пункт 8") — текст отчёта каждый раз генерируется заново и его
@@ -1461,7 +1381,7 @@ async def handle_confirm_payment(update: Update, context: ContextTypes.DEFAULT_T
     # Сразу показываем промежуточный статус — генерация через Claude API
     # обычно занимает 10-30 секунд, и без этого сообщения кажется, что
     # кнопка зависла.
-    await edit_admin_message(query, "⏳ Генерирую отчёт и отправляю... (обычно 15-30 секунд)")
+    await edit_admin_message(query, "⏳ Генерирую отчёт и отправляю... (обычно 20-60 секунд, иногда дольше)")
 
     # Пытаемся сгенерировать настоящий синтез через Claude API (список из 15
     # секций содержания). Если не получилось (нет ключа, ошибка сети, модель
@@ -1506,22 +1426,8 @@ async def handle_confirm_payment(update: Update, context: ContextTypes.DEFAULT_T
         logger.exception("Не удалось отправить отчёт пользователю %s в Telegram", target_id)
         telegram_ok = False
 
-    academy_cta_html = format_academy_cta_text().replace("\n", "<br>")
-    html_body = (
-        "<h2>Твой полный профиль продавца</h2><p>"
-        + report_text.replace("\n", "<br>")
-        + "</p><hr><p>"
-        + academy_cta_html
-        + f'</p><p><a href="{CHANNEL_URL}">Перейти в канал Академии продаж</a></p>'
-        + f'<p><a href="{COURSE_URL}">Пройти курс «Профессиональный продавец» (30 возражений «Это дорого»)</a></p>'
-    )
-    email_ok = send_report_email(
-        record["email"], "Твой полный профиль продавца", html_body
-    )
-
     status_lines = [f"✅ Отправлено: {record.get('username') or record.get('full_name') or target_id}"]
     status_lines.append(f"Telegram: {'ok' if telegram_ok else '⚠️ не доставлено (бот заблокирован?)'}")
-    status_lines.append(f"Email ({record['email']}): {'ok' if email_ok else '⚠️ не отправлен'}")
     if used_fallback:
         status_lines.append(f"⚠️ Отправлена склеенная версия ({error_reason})")
     await edit_admin_message(query, "\n".join(status_lines))
@@ -1552,7 +1458,7 @@ async def pending_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         button = InlineKeyboardMarkup(
             [[InlineKeyboardButton("✅ Подтвердить и отправить", callback_data=f"confirm|{uid}")]]
         )
-        caption = f"{contact} — {record['email']}"
+        caption = contact
         if record.get("receipt_file_id"):
             if record.get("receipt_is_photo", True):
                 await update.message.reply_photo(
@@ -1741,7 +1647,6 @@ def main():
     application.add_handler(CallbackQueryHandler(handle_confirm_payment, pattern=r"^confirm\|"))
     application.add_handler(MessageHandler(filters.PHOTO, handle_receipt_photo))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_receipt_document))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
     application.add_error_handler(on_error)
 
     logger.info("Бот запущен, ждём сообщения...")
