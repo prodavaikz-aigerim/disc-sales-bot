@@ -884,7 +884,7 @@ def format_paid_offer_text() -> str:
             "обучения, умеешь общаться с клиентами."
         ),
         "",
-        "Но иногда происходит странное:",
+        "🤔 Но иногда происходит странное:",
         "",
         "— ты знаешь, что нужно сказать клиенту, но в нужный момент говоришь не то;",
         (
@@ -902,15 +902,15 @@ def format_paid_offer_text() -> str:
             "слабость, которая может стоить тебе денег."
         ),
         "",
-        "И вот здесь начинается самое интересное.",
+        "💡 <b>И вот здесь начинается самое интересное.</b>",
         "",
         "Я сама прошла этот тест в 2014 году.",
-        "Тогда я заплатила за него 30 000 ₸.",
+        "Тогда я заплатила за него <b>30 000 ₸</b>.",
         "",
         "И знаете, что произошло?",
         "Я увидела в себе то, чего раньше просто не замечала.",
         "Я поняла своё слабое место в продажах.",
-        "Когда я начала с этим работать, мои продажи выросли ровно в 3 раза.",
+        "📈 <b>Когда я начала с этим работать, мои продажи выросли ровно в 3 раза.</b>",
         "",
         (
             "Для меня это был не просто тест. Это был момент, когда я "
@@ -944,7 +944,7 @@ def format_paid_offer_text() -> str:
         "15. Твой персональный план развития",
         "",
         (
-            "Благодаря этому ты увидишь, где именно ты теряешь деньги в "
+            "🎯 Благодаря этому ты увидишь, где именно ты теряешь деньги в "
             "продажах, потому что наконец поймёшь себя как продавца."
         ),
         "",
@@ -957,10 +957,10 @@ def format_paid_offer_text() -> str:
         ),
         "",
         "И самое главное — тебе не нужно становиться другим человеком.",
-        "Тебе нужно научиться использовать именно свои сильные стороны как инструмент продаж.",
+        "<b>Тебе нужно научиться использовать именно свои сильные стороны как инструмент продаж.</b>",
         "",
         "💰 В 2014 году я заплатила за этот разбор 30 000 ₸.",
-        f"Сегодня ты можешь получить полный персональный разбор всего за {FULL_REPORT_PRICE}.",
+        f"Сегодня ты можешь получить полный персональный разбор всего за <b>{FULL_REPORT_PRICE}</b>.",
         "",
         "Одна дополнительная продажа может окупить этот разбор многократно.",
     ]
@@ -1033,7 +1033,7 @@ def send_report_email(to_email: str, subject: str, html_body: str) -> bool:
         message["To"] = to_email
         message.attach(MIMEText(html_body, "html", "utf-8"))
 
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
             server.starttls()
             server.login(SMTP_USER, SMTP_PASSWORD)
             server.sendmail(SMTP_FROM_EMAIL, [to_email], message.as_string())
@@ -1123,20 +1123,17 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     await send_payment_instructions(update, context)
 
 
-async def handle_receipt_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ловит фото — если пользователь ждёт отправки чека, пересылаем его админу.
+async def process_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE, file_id: str, is_photo: bool):
+    """Общая логика для чека, присланного как фото ИЛИ как документ (PDF и т.п.).
 
-    Если фото пришло не в рамках ожидания чека (awaiting_receipt не
-    выставлен), ничего не делаем — бот не разбирает произвольные фото.
+    Сохраняет заявку, отвечает пользователю и уведомляет админа —
+    единственное отличие двух путей входа в том, каким методом Telegram
+    переслать файл админу (send_photo / send_document).
     """
-    if not context.user_data.get("awaiting_receipt"):
-        return
-
     context.user_data["awaiting_receipt"] = False
 
     user = update.effective_user
     email = context.user_data.get("email", "")
-    receipt_file_id = update.message.photo[-1].file_id
 
     pending = context.bot_data.setdefault("pending", {})
     pending[str(user.id)] = {
@@ -1145,7 +1142,8 @@ async def handle_receipt_photo(update: Update, context: ContextTypes.DEFAULT_TYP
         "email": email,
         "username": user.username,
         "full_name": user.full_name,
-        "receipt_file_id": receipt_file_id,
+        "receipt_file_id": file_id,
+        "receipt_is_photo": is_photo,
     }
 
     followup = "Спасибо! Проверю оплату и пришлю тебе полный разбор — сюда и на почту."
@@ -1171,14 +1169,40 @@ async def handle_receipt_photo(update: Update, context: ContextTypes.DEFAULT_TYP
         [[InlineKeyboardButton("✅ Подтвердить и отправить", callback_data=f"confirm|{user.id}")]]
     )
     try:
-        await context.bot.send_photo(
-            chat_id=ADMIN_CHAT_ID,
-            photo=receipt_file_id,
-            caption=caption,
-            reply_markup=confirm_button,
-        )
+        if is_photo:
+            await context.bot.send_photo(
+                chat_id=ADMIN_CHAT_ID,
+                photo=file_id,
+                caption=caption,
+                reply_markup=confirm_button,
+            )
+        else:
+            await context.bot.send_document(
+                chat_id=ADMIN_CHAT_ID,
+                document=file_id,
+                caption=caption,
+                reply_markup=confirm_button,
+            )
     except TelegramError:
         logger.exception("Не удалось отправить уведомление админу о заявке %s", user.id)
+
+
+async def handle_receipt_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ловит фото-чеки. Если пользователь не в процессе отправки чека —
+    ничего не делаем (бот не разбирает произвольные фото).
+    """
+    if not context.user_data.get("awaiting_receipt"):
+        return
+    await process_receipt(update, context, update.message.photo[-1].file_id, is_photo=True)
+
+
+async def handle_receipt_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ловит чеки, присланные файлом (например, PDF) — раньше такие чеки
+    вообще не обрабатывались (бот молчал), теперь принимаются наравне с фото.
+    """
+    if not context.user_data.get("awaiting_receipt"):
+        return
+    await process_receipt(update, context, update.message.document.file_id, is_photo=False)
 
 
 
@@ -1264,6 +1288,7 @@ def build_report_prompt(disc_scores: dict, motivator_scores: dict) -> str:
 - В разделе 15 дай 2-3 конкретных, выполнимых шага, а не общие пожелания.
 - ОБЯЗАТЕЛЬНО допиши все 15 разделов до конца, включая последний. Если чувствуешь, что не укладываешься в объём — сокращай более ранние разделы, но не обрывай отчёт раньше времени.
 - Не используй слово "DISC" — только "психотип".
+- ВАЖНО: пиши гендерно-нейтрально — ты не знаешь пол читателя. Избегай форм, которые требуют согласования по роду ("ты решительна/решителен", "ты сказала/сказал", "уверенная/уверенный"). Вместо этого строй фразы нейтрально: "у тебя есть решительность", "тебе свойственно говорить прямо", "твоя уверенность". Текст должен одинаково естественно звучать и для мужчины, и для женщины.
 - Общий объём — примерно 900-1400 слов."""
 
     return prompt
@@ -1284,7 +1309,7 @@ async def generate_full_report(disc_scores: dict, motivator_scores: dict) -> lis
     prompt = build_report_prompt(disc_scores, motivator_scores)
 
     def _call():
-        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=45.0)
         response = client.messages.create(
             model=ANTHROPIC_MODEL,
             max_tokens=4096,
@@ -1366,8 +1391,15 @@ def format_academy_cta_text() -> str:
             "тренированный навык."
         ),
         "",
-        "👉 Подпишись на канал Академии продаж — там разборы реальных "
-        "переговоров, доступ к тренажёру и даты ближайшего потока.",
+        (
+            "🔥 Хочешь прямо сейчас закрыть своё главное возражение? "
+            "Пройди профессиональное обучение по продажам с отработкой "
+            "<b>30 возражений «Это дорого»</b> — его уже прошли "
+            "<b>свыше 12 000 человек</b>. А дальше сможешь перейти на "
+            "тариф «Продажи по психотипам клиента»."
+        ),
+        "",
+        "👇 Выбирай, с чего начать:",
     ]
     return "\n".join(lines)
 
@@ -1418,6 +1450,11 @@ async def handle_confirm_payment(update: Update, context: ContextTypes.DEFAULT_T
     disc_scores = record["disc_scores"]
     motivator_scores = record["motivator_scores"]
 
+    # Сразу показываем промежуточный статус — генерация через Claude API
+    # обычно занимает 10-30 секунд, и без этого сообщения кажется, что
+    # кнопка зависла.
+    await edit_admin_message(query, "⏳ Генерирую отчёт и отправляю... (обычно 15-30 секунд)")
+
     # Пытаемся сгенерировать настоящий синтез через Claude API (список из 15
     # секций содержания). Если не получилось (нет ключа, ошибка сети, модель
     # вернула не 15 частей) — подстраховываемся склеенной версией двух
@@ -1446,7 +1483,10 @@ async def handle_confirm_payment(update: Update, context: ContextTypes.DEFAULT_T
 
         academy_cta_text = format_academy_cta_text()
         academy_buttons = InlineKeyboardMarkup(
-            [[InlineKeyboardButton(CHANNEL_BUTTON_TEXT, url=CHANNEL_URL)]]
+            [
+                [InlineKeyboardButton(CHANNEL_BUTTON_TEXT, url=CHANNEL_URL)],
+                [InlineKeyboardButton(COURSE_BUTTON_TEXT, url=COURSE_URL)],
+            ]
         )
         await context.bot.send_message(
             chat_id=target_id,
@@ -1465,6 +1505,7 @@ async def handle_confirm_payment(update: Update, context: ContextTypes.DEFAULT_T
         + "</p><hr><p>"
         + academy_cta_html
         + f'</p><p><a href="{CHANNEL_URL}">Перейти в канал Академии продаж</a></p>'
+        + f'<p><a href="{COURSE_URL}">Пройти обучение по продажам (30 возражений «Это дорого»)</a></p>'
     )
     email_ok = send_report_email(
         record["email"], "Твой полный профиль продавца", html_body
@@ -1479,8 +1520,10 @@ async def handle_confirm_payment(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def edit_admin_message(query, new_text: str):
-    """Правит сообщение админу после подтверждения — фото (с подписью) или обычный текст."""
-    if query.message.photo:
+    """Правит сообщение админу после подтверждения — медиа с подписью (фото
+    или документ) или обычный текст.
+    """
+    if query.message.photo or query.message.document:
         await query.edit_message_caption(caption=new_text)
     else:
         await query.edit_message_text(new_text)
@@ -1503,9 +1546,14 @@ async def pending_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         caption = f"{contact} — {record['email']}"
         if record.get("receipt_file_id"):
-            await update.message.reply_photo(
-                photo=record["receipt_file_id"], caption=caption, reply_markup=button
-            )
+            if record.get("receipt_is_photo", True):
+                await update.message.reply_photo(
+                    photo=record["receipt_file_id"], caption=caption, reply_markup=button
+                )
+            else:
+                await update.message.reply_document(
+                    document=record["receipt_file_id"], caption=caption, reply_markup=button
+                )
         else:
             await update.message.reply_text(caption, reply_markup=button)
 
@@ -1684,6 +1732,7 @@ def main():
     application.add_handler(CallbackQueryHandler(request_full_report, pattern=r"^request_report$"))
     application.add_handler(CallbackQueryHandler(handle_confirm_payment, pattern=r"^confirm\|"))
     application.add_handler(MessageHandler(filters.PHOTO, handle_receipt_photo))
+    application.add_handler(MessageHandler(filters.Document.ALL, handle_receipt_document))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
     application.add_error_handler(on_error)
 
