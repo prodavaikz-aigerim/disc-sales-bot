@@ -19,6 +19,7 @@ DISC-тест психотипа продавца для Telegram.
   окружения — см. .env.example
 """
 
+import asyncio
 import logging
 import os
 import random
@@ -27,6 +28,7 @@ import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
+import anthropic
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.error import TelegramError
@@ -83,6 +85,17 @@ ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "")
 # Необязательно: твой Telegram username (без @) — если задать, после
 # отправки чека пользователь увидит ссылку написать тебе лично напрямую.
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "")
+
+# Генерация полного платного отчёта (15 пунктов) через Claude API — вместо
+# простой склейки двух текстов. Если ANTHROPIC_API_KEY не задан или запрос
+# к API не удался — бот подстрахуется и пришлёт склеенную версию
+# (format_full_result_text + format_motivator_full_text), чтобы клиент в
+# любом случае получил хоть какой-то отчёт после оплаты.
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+# Название модели может со временем меняться — актуальные варианты
+# смотри в документации Anthropic (docs.anthropic.com), если этот
+# конкретный id перестанет работать.
+ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-5")
 
 # Настройки почты для дублирования отчёта на email (SMTP). Если оставить
 # SMTP_HOST пустым — email просто не отправляется, отчёт уходит только в
@@ -1105,6 +1118,120 @@ async def handle_receipt_photo(update: Update, context: ContextTypes.DEFAULT_TYP
         logger.exception("Не удалось отправить уведомление админу о заявке %s", user.id)
 
 
+def build_report_prompt(disc_scores: dict, motivator_scores: dict) -> str:
+    """Собирает промпт для Claude API — все сырые данные о человеке.
+
+    Модель получает реальные баллы и уже готовые тексты по каждому типу/коду
+    (сильные стороны, зоны роста, рекомендации, тизеры мотивации) и должна
+    СИНТЕЗИРОВАТЬ из них связный отчёт — не просто пересказать, а показать,
+    как психотип и код мотивации взаимодействуют друг с другом.
+    """
+    disc_ranked = sorted(disc_scores.items(), key=lambda item: item[1], reverse=True)
+    m_ranked = sorted(motivator_scores.items(), key=lambda item: item[1], reverse=True)
+
+    disc_lines = []
+    for code, score in disc_ranked:
+        p = PROFILES[code]
+        disc_lines.append(
+            f"- {p['name']} ({score}/{TOTAL_QUESTIONS} баллов) — {p['subtitle']}\n"
+            f"  Сильные стороны: {'; '.join(p['strengths'])}\n"
+            f"  Зоны роста: {'; '.join(p['weaknesses'])}\n"
+            f"  Рекомендации: {'; '.join(p['recommendations'])}"
+        )
+
+    m_lines = []
+    for code, score in m_ranked:
+        p = MOTIVATOR_PROFILES[code]
+        m_lines.append(
+            f"- Код {p['name']} ({score}/20 баллов) — {p['subtitle']}. {p['teaser']}"
+        )
+
+    prompt = f"""Ты помогаешь составить персональный отчёт о психотипе продавца по методике DISC и коду мотивации в деньгах (по модели Спрэнгера/PIAV, адаптированной под "коды").
+
+Вот баллы и готовые описания конкретного человека:
+
+ПСИХОТИП (баллы по 4 типам, от высшего к низшему):
+{chr(10).join(disc_lines)}
+
+КОД МОТИВАЦИИ В ДЕНЬГАХ (баллы по 6 категориям, от высшего к низшему):
+{chr(10).join(m_lines)}
+
+Напиши персональный отчёт РОВНО из 15 пронумерованных разделов, в такой последовательности:
+1. Мой психотип
+2. Мой код мотивации
+3. Как я принимаю решения
+4. Как я продаю
+5. Как я проявляюсь с клиентом
+6. Мои сильные стороны
+7. Мои риски
+8. Моё главное слепое пятно
+9. Мои денежные драйверы
+10. Что меня демотивирует
+11. Какие клиенты мне подходят
+12. С какими клиентами сложнее
+13. Как мне адаптировать продажи
+14. Как мне вести переговоры
+15. Мой персональный план развития
+
+Требования:
+- Обращайся на "ты", тон прямой, живой, без канцелярита и воды.
+- Раздел 8 ("слепое пятно") — самое важное: покажи конкретно, как ведущий психотип И ведущий код мотивации УСИЛИВАЮТ друг друга и создают конкретную проблему в продажах (не общие слова, а конкретный сценарий).
+- Не повторяй дословно списки выше — переработай их в связный текст, используй их как основу, а не как готовый ответ.
+- Каждый раздел — 2-5 предложений, по делу, без ссылок и разделителей markdown (не используй звёздочки, решётки и подобное форматирование — только обычный текст с номерами разделов).
+- В разделе 15 дай 2-3 конкретных, выполнимых шага, а не общие пожелания.
+- Не используй слово "DISC" — только "психотип".
+- Общий объём — примерно 900-1400 слов."""
+
+    return prompt
+
+
+async def generate_full_report(disc_scores: dict, motivator_scores: dict) -> str:
+    """Генерирует полный отчёт через Claude API. При любой ошибке —
+    возвращает None, и вызывающий код подставит склеенную версию (фолбэк).
+    """
+    if not ANTHROPIC_API_KEY:
+        logger.warning("ANTHROPIC_API_KEY не задан — используется склеенный отчёт (фолбэк)")
+        return None
+
+    prompt = build_report_prompt(disc_scores, motivator_scores)
+
+    def _call():
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        response = client.messages.create(
+            model=ANTHROPIC_MODEL,
+            max_tokens=3000,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return "".join(block.text for block in response.content if block.type == "text")
+
+    try:
+        return await asyncio.to_thread(_call)
+    except Exception:
+        logger.exception("Не удалось сгенерировать отчёт через Claude API — используется фолбэк")
+        return None
+
+
+def split_for_telegram(text: str, limit: int = 3500) -> list:
+    """Режет длинный текст на куски под лимит сообщения Telegram (4096 символов),
+    стараясь резать по границам абзацев, а не посреди предложения.
+    """
+    if len(text) <= limit:
+        return [text]
+
+    chunks = []
+    current = ""
+    for paragraph in text.split("\n\n"):
+        candidate = f"{current}\n\n{paragraph}" if current else paragraph
+        if len(candidate) > limit and current:
+            chunks.append(current)
+            current = paragraph
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return chunks
+
+
 async def handle_confirm_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
 
@@ -1127,8 +1254,21 @@ async def handle_confirm_payment(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     target_id = int(target_id_str)
-    disc_text = format_full_result_text(record["disc_scores"])
-    motivator_text = format_motivator_full_text(record["motivator_scores"])
+    disc_scores = record["disc_scores"]
+    motivator_scores = record["motivator_scores"]
+
+    # Пытаемся сгенерировать настоящий синтез через Claude API. Если не
+    # получилось (нет ключа, ошибка сети и т.д.) — подстраховываемся
+    # склеенной версией двух статических полных отчётов, чтобы клиент в
+    # любом случае получил результат.
+    report_text = await generate_full_report(disc_scores, motivator_scores)
+    used_fallback = report_text is None
+    if report_text is None:
+        report_text = (
+            format_full_result_text(disc_scores)
+            + "\n\n"
+            + format_motivator_full_text(motivator_scores)
+        )
 
     telegram_ok = True
     try:
@@ -1136,21 +1276,14 @@ async def handle_confirm_payment(update: Update, context: ContextTypes.DEFAULT_T
             chat_id=target_id,
             text="🎉 Оплата подтверждена! Вот твой полный профиль продавца.",
         )
-        await context.bot.send_message(
-            chat_id=target_id, text=disc_text, parse_mode=ParseMode.HTML
-        )
-        await context.bot.send_message(
-            chat_id=target_id, text=motivator_text, parse_mode=ParseMode.HTML
-        )
+        for chunk in split_for_telegram(report_text):
+            parse_mode = ParseMode.HTML if used_fallback else None
+            await context.bot.send_message(chat_id=target_id, text=chunk, parse_mode=parse_mode)
     except TelegramError:
         logger.exception("Не удалось отправить отчёт пользователю %s в Telegram", target_id)
         telegram_ok = False
 
-    html_body = (
-        "<h2>Твой полный профиль продавца</h2>"
-        + "<p>" + disc_text.replace("\n", "<br>") + "</p>"
-        + "<p>" + motivator_text.replace("\n", "<br>") + "</p>"
-    )
+    html_body = "<h2>Твой полный профиль продавца</h2><p>" + report_text.replace("\n", "<br>") + "</p>"
     email_ok = send_report_email(
         record["email"], "Твой полный профиль продавца", html_body
     )
@@ -1158,6 +1291,8 @@ async def handle_confirm_payment(update: Update, context: ContextTypes.DEFAULT_T
     status_lines = [f"✅ Отправлено: {record.get('username') or record.get('full_name') or target_id}"]
     status_lines.append(f"Telegram: {'ok' if telegram_ok else '⚠️ не доставлено (бот заблокирован?)'}")
     status_lines.append(f"Email ({record['email']}): {'ok' if email_ok else '⚠️ не отправлен'}")
+    if used_fallback:
+        status_lines.append("⚠️ Отправлена склеенная версия (Claude API недоступен/не настроен)")
     await edit_admin_message(query, "\n".join(status_lines))
 
 
