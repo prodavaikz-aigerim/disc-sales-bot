@@ -20,6 +20,7 @@ DISC-тест психотипа продавца для Telegram.
 """
 
 import asyncio
+import html
 import logging
 import os
 import random
@@ -1118,6 +1119,31 @@ async def handle_receipt_photo(update: Update, context: ContextTypes.DEFAULT_TYP
         logger.exception("Не удалось отправить уведомление админу о заявке %s", user.id)
 
 
+
+# Заголовки 15 разделов отчёта — фиксированные, с эмодзи по смыслу каждого
+# пункта. Заголовки и жирный шрифт вставляем мы сами (не модель) — так
+# форматирование гарантированно валидно и не ломает отправку в Telegram.
+REPORT_SECTION_TITLES = [
+    ("🧠", "Мой психотип"),
+    ("💰", "Мой код мотивации"),
+    ("🧭", "Как я принимаю решения"),
+    ("🤝", "Как я продаю"),
+    ("👥", "Как я проявляюсь с клиентом"),
+    ("💪", "Мои сильные стороны"),
+    ("⚠️", "Мои риски"),
+    ("🕳️", "Моё главное слепое пятно"),
+    ("🚀", "Мои денежные драйверы"),
+    ("🔋", "Что меня демотивирует"),
+    ("✅", "Какие клиенты мне подходят"),
+    ("🚧", "С какими клиентами сложнее"),
+    ("🎯", "Как мне адаптировать продажи"),
+    ("🗣️", "Как мне вести переговоры"),
+    ("📈", "Мой персональный план развития"),
+]
+
+REPORT_SECTION_DELIMITER = "###РАЗДЕЛ###"
+
+
 def build_report_prompt(disc_scores: dict, motivator_scores: dict) -> str:
     """Собирает промпт для Claude API — все сырые данные о человеке.
 
@@ -1146,6 +1172,10 @@ def build_report_prompt(disc_scores: dict, motivator_scores: dict) -> str:
             f"- Код {p['name']} ({score}/20 баллов) — {p['subtitle']}. {p['teaser']}"
         )
 
+    section_list = "\n".join(
+        f"{i + 1}. {title}" for i, (_, title) in enumerate(REPORT_SECTION_TITLES)
+    )
+
     prompt = f"""Ты помогаешь составить персональный отчёт о психотипе продавца по методике DISC и коду мотивации в деньгах (по модели Спрэнгера/PIAV, адаптированной под "коды").
 
 Вот баллы и готовые описания конкретного человека:
@@ -1156,38 +1186,34 @@ def build_report_prompt(disc_scores: dict, motivator_scores: dict) -> str:
 КОД МОТИВАЦИИ В ДЕНЬГАХ (баллы по 6 категориям, от высшего к низшему):
 {chr(10).join(m_lines)}
 
-Напиши персональный отчёт РОВНО из 15 пронумерованных разделов, в такой последовательности:
-1. Мой психотип
-2. Мой код мотивации
-3. Как я принимаю решения
-4. Как я продаю
-5. Как я проявляюсь с клиентом
-6. Мои сильные стороны
-7. Мои риски
-8. Моё главное слепое пятно
-9. Мои денежные драйверы
-10. Что меня демотивирует
-11. Какие клиенты мне подходят
-12. С какими клиентами сложнее
-13. Как мне адаптировать продажи
-14. Как мне вести переговоры
-15. Мой персональный план развития
+Напиши персональный отчёт РОВНО из 15 разделов в такой последовательности:
+{section_list}
 
-Требования:
+Формат ответа — ОЧЕНЬ ВАЖНО:
+- Не пиши номера и заголовки разделов сами — заголовки уже есть, ты пишешь только текст содержания.
+- Раздели содержание разделов друг от друга строкой "{REPORT_SECTION_DELIMITER}" на отдельной строке (между каждой парой соседних разделов, всего 14 разделителей между 15 разделами).
+- Не используй markdown-разметку вообще (ни звёздочки, ни решётки, ни другие символы форматирования) — только обычный текст.
+
+Требования к содержанию:
 - Обращайся на "ты", тон прямой, живой, без канцелярита и воды.
-- Раздел 8 ("слепое пятно") — самое важное: покажи конкретно, как ведущий психотип И ведущий код мотивации УСИЛИВАЮТ друг друга и создают конкретную проблему в продажах (не общие слова, а конкретный сценарий).
+- Раздел 8 ("Моё главное слепое пятно") — самое важное: покажи конкретно, как ведущий психотип И ведущий код мотивации УСИЛИВАЮТ друг друга и создают конкретную проблему в продажах (не общие слова, а конкретный сценарий).
 - Не повторяй дословно списки выше — переработай их в связный текст, используй их как основу, а не как готовый ответ.
-- Каждый раздел — 2-5 предложений, по делу, без ссылок и разделителей markdown (не используй звёздочки, решётки и подобное форматирование — только обычный текст с номерами разделов).
+- Каждый раздел — 2-5 предложений, по делу.
 - В разделе 15 дай 2-3 конкретных, выполнимых шага, а не общие пожелания.
+- ОБЯЗАТЕЛЬНО допиши все 15 разделов до конца, включая последний. Если чувствуешь, что не укладываешься в объём — сокращай более ранние разделы, но не обрывай отчёт раньше времени.
 - Не используй слово "DISC" — только "психотип".
 - Общий объём — примерно 900-1400 слов."""
 
     return prompt
 
 
-async def generate_full_report(disc_scores: dict, motivator_scores: dict) -> str:
-    """Генерирует полный отчёт через Claude API. При любой ошибке —
-    возвращает None, и вызывающий код подставит склеенную версию (фолбэк).
+async def generate_full_report(disc_scores: dict, motivator_scores: dict) -> list:
+    """Генерирует полный отчёт через Claude API.
+
+    Возвращает список из 15 строк (содержание каждого раздела, без
+    заголовков — заголовки добавляются отдельно, см. format_report_html).
+    При любой ошибке или если модель вернула не 15 частей — возвращает
+    None, и вызывающий код подставит фолбэк.
     """
     if not ANTHROPIC_API_KEY:
         logger.warning("ANTHROPIC_API_KEY не задан — используется склеенный отчёт (фолбэк)")
@@ -1199,16 +1225,89 @@ async def generate_full_report(disc_scores: dict, motivator_scores: dict) -> str
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
         response = client.messages.create(
             model=ANTHROPIC_MODEL,
-            max_tokens=3000,
+            max_tokens=4096,
             messages=[{"role": "user", "content": prompt}],
         )
         return "".join(block.text for block in response.content if block.type == "text")
 
     try:
-        return await asyncio.to_thread(_call)
+        raw_text = await asyncio.to_thread(_call)
     except Exception:
         logger.exception("Не удалось сгенерировать отчёт через Claude API — используется фолбэк")
         return None
+
+    sections = [part.strip() for part in raw_text.split(REPORT_SECTION_DELIMITER)]
+
+    if len(sections) != len(REPORT_SECTION_TITLES):
+        logger.warning(
+            "Claude API вернул %s разделов вместо %s — используется фолбэк",
+            len(sections),
+            len(REPORT_SECTION_TITLES),
+        )
+        return None
+
+    return sections
+
+
+def format_report_html(sections: list) -> str:
+    """Собирает финальный HTML-текст отчёта: жирные заголовки с эмодзи (наши,
+    гарантированно валидные) + экранированное содержание от модели (защита
+    от случайных символов < > &, которые сломали бы разбор Telegram).
+    """
+    blocks = []
+    for (emoji, title), body in zip(REPORT_SECTION_TITLES, sections):
+        escaped_body = html.escape(body)
+        blocks.append(f"<b>{emoji} {title}</b>\n{escaped_body}")
+    return "\n\n".join(blocks)
+
+
+def format_academy_cta_text() -> str:
+    """Нативная реклама Академии продаж — отправляется отдельным сообщением
+    сразу после полного отчёта (и в Telegram, и добавляется в email).
+
+    Сознательно не ссылается на конкретные номера пунктов отчёта (типа
+    "см. пункт 8") — текст отчёта каждый раз генерируется заново и его
+    структура/нумерация не гарантированно останется идентичной, поэтому
+    здесь используются общие формулировки ("твоё слепое пятно" без номера).
+    """
+    lines = [
+        "🎓 <b>Что дальше</b>\n",
+        (
+            "Знать свой психотип — это только половина дела. Разница между "
+            "«знаю теорию» и «реально продаю больше» происходит на живых "
+            "переговорах — там, где не полистаешь этот отчёт перед ответом "
+            "клиенту."
+        ),
+        "",
+        (
+            "Именно для этого в Академии продаж есть два инструмента, "
+            "которые закрывают ровно твоё слепое пятно из отчёта выше:"
+        ),
+        "",
+        (
+            "🤖 <b>ИИ-тренажёр переговоров.</b> Отрабатываешь диалог с "
+            "клиентом твоего «сложного» типа прямо в тренажёре — он "
+            "реагирует так же, как живой человек: тормозит, сомневается, "
+            "задаёт неудобные вопросы. Тренируешься держать паузу заранее, "
+            "без риска слить реальную сделку."
+        ),
+        "",
+        (
+            "📚 <b>Курс «Психотипы в продажах».</b> Учимся определять "
+            "психотип клиента не через тест, а по первым фразам в "
+            "разговоре — и сразу подстраивать подачу под него, а не "
+            "работать в одном темпе со всеми."
+        ),
+        "",
+        (
+            "Слепое пятно — это не приговор, это просто ещё не "
+            "тренированный навык."
+        ),
+        "",
+        "👉 Подпишись на канал Академии продаж — там разборы реальных "
+        "переговоров, доступ к тренажёру и даты ближайшего потока.",
+    ]
+    return "\n".join(lines)
 
 
 def split_for_telegram(text: str, limit: int = 3500) -> list:
@@ -1257,18 +1356,22 @@ async def handle_confirm_payment(update: Update, context: ContextTypes.DEFAULT_T
     disc_scores = record["disc_scores"]
     motivator_scores = record["motivator_scores"]
 
-    # Пытаемся сгенерировать настоящий синтез через Claude API. Если не
-    # получилось (нет ключа, ошибка сети и т.д.) — подстраховываемся
-    # склеенной версией двух статических полных отчётов, чтобы клиент в
-    # любом случае получил результат.
-    report_text = await generate_full_report(disc_scores, motivator_scores)
-    used_fallback = report_text is None
-    if report_text is None:
+    # Пытаемся сгенерировать настоящий синтез через Claude API (список из 15
+    # секций содержания). Если не получилось (нет ключа, ошибка сети, модель
+    # вернула не 15 частей) — подстраховываемся склеенной версией двух
+    # статических полных отчётов, чтобы клиент в любом случае получил
+    # результат. И в том, и в другом случае итоговый текст — валидный HTML
+    # (заголовки жирным мы добавляем сами, содержание экранировано).
+    sections = await generate_full_report(disc_scores, motivator_scores)
+    used_fallback = sections is None
+    if sections is None:
         report_text = (
             format_full_result_text(disc_scores)
             + "\n\n"
             + format_motivator_full_text(motivator_scores)
         )
+    else:
+        report_text = format_report_html(sections)
 
     telegram_ok = True
     try:
@@ -1277,13 +1380,30 @@ async def handle_confirm_payment(update: Update, context: ContextTypes.DEFAULT_T
             text="🎉 Оплата подтверждена! Вот твой полный профиль продавца.",
         )
         for chunk in split_for_telegram(report_text):
-            parse_mode = ParseMode.HTML if used_fallback else None
-            await context.bot.send_message(chat_id=target_id, text=chunk, parse_mode=parse_mode)
+            await context.bot.send_message(chat_id=target_id, text=chunk, parse_mode=ParseMode.HTML)
+
+        academy_cta_text = format_academy_cta_text()
+        academy_buttons = InlineKeyboardMarkup(
+            [[InlineKeyboardButton(CHANNEL_BUTTON_TEXT, url=CHANNEL_URL)]]
+        )
+        await context.bot.send_message(
+            chat_id=target_id,
+            text=academy_cta_text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=academy_buttons,
+        )
     except TelegramError:
         logger.exception("Не удалось отправить отчёт пользователю %s в Telegram", target_id)
         telegram_ok = False
 
-    html_body = "<h2>Твой полный профиль продавца</h2><p>" + report_text.replace("\n", "<br>") + "</p>"
+    academy_cta_html = format_academy_cta_text().replace("\n", "<br>")
+    html_body = (
+        "<h2>Твой полный профиль продавца</h2><p>"
+        + report_text.replace("\n", "<br>")
+        + "</p><hr><p>"
+        + academy_cta_html
+        + f'</p><p><a href="{CHANNEL_URL}">Перейти в канал Академии продаж</a></p>'
+    )
     email_ok = send_report_email(
         record["email"], "Твой полный профиль продавца", html_body
     )
