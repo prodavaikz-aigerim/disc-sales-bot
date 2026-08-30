@@ -1256,7 +1256,7 @@ async def generate_full_report(disc_scores: dict, motivator_scores: dict):
     prompt = build_report_prompt(disc_scores, motivator_scores)
 
     def _call():
-        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=120.0)
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=240.0)
         response = client.messages.create(
             model=ANTHROPIC_MODEL,
             max_tokens=6000,
@@ -1402,7 +1402,7 @@ async def handle_confirm_payment(update: Update, context: ContextTypes.DEFAULT_T
     # Сразу показываем промежуточный статус — генерация через Claude API
     # обычно занимает 10-30 секунд, и без этого сообщения кажется, что
     # кнопка зависла.
-    await edit_admin_message(query, "⏳ Генерирую отчёт и отправляю... (обычно 20-60 секунд, иногда дольше)")
+    await edit_admin_message(query, "⏳ Генерирую отчёт и отправляю... (отчёт стал длиннее, обычно 30-90 секунд, иногда до 2-3 минут)")
 
     # Пытаемся сгенерировать настоящий синтез через Claude API (список из 15
     # секций содержания). Если не получилось (нет ключа, ошибка сети, модель
