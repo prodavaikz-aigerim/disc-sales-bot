@@ -24,6 +24,7 @@ import html
 import logging
 import os
 import random
+import time
 
 import anthropic
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -82,6 +83,12 @@ ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "")
 # Необязательно: твой Telegram username (без @) — если задать, после
 # отправки чека пользователь увидит ссылку написать тебе лично напрямую.
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "")
+
+# РЕЖИМ ОЦЕНКИ КАНДИДАТОВ (для рекрутинга) — если человек запускает бота
+# по специальной ссылке вида https://t.me/имя_бота?start=candidate, тест
+# проходит бесплатно, без оффера и оплаты, а полный отчёт автоматически
+# уходит тебе (ADMIN_CHAT_ID) с указанием, кто из кандидатов его прошёл.
+CANDIDATE_START_PARAM = os.environ.get("CANDIDATE_START_PARAM", "candidate")
 
 # Генерация полного платного отчёта (15 пунктов) через Claude API — вместо
 # простой склейки двух текстов. Если ANTHROPIC_API_KEY не задан или запрос
@@ -588,6 +595,13 @@ async def send_question(update_or_query, context: ContextTypes.DEFAULT_TYPE, qin
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Определяем режим "оценка кандидата" по deep-link параметру
+    # (https://t.me/имя_бота?start=candidate). Флаг живёт в user_data на
+    # протяжении всего прохождения обоих тестов этим человеком.
+    args = context.args if context.args else []
+    is_candidate = len(args) > 0 and args[0] == CANDIDATE_START_PARAM
+    context.user_data["is_candidate"] = is_candidate
+
     # Если пользователь уже начинал тест, но не дошёл до конца (current_q
     # задан и не None) — это значит, что предыдущий прогон прервался
     # (например, бот перезапускался и его прогресс не сохранился).
@@ -610,15 +624,26 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "предыдущий результат будет заменён новым."
         )
 
-    intro = (
-        "Привет! 👋\n\n"
-        "Это короткий тест на твой психотип продавца "
-        "(Красный / Жёлтый / Зелёный / Синий).\n\n"
-        f"Тебя ждёт {TOTAL_QUESTIONS} вопросов, отвечай честно и быстро — "
-        "первый вариант, который откликается, обычно самый точный.\n"
-        "В конце ты узнаешь свои 2 ведущих психотипа.\n\n"
-        "Погнали!"
-    )
+    if is_candidate:
+        intro = (
+            "Привет! 👋\n\n"
+            "Это тест на психотип и код мотивации в продажах — часть отбора "
+            "кандидатов.\n\n"
+            f"Тебя ждёт {TOTAL_QUESTIONS} вопросов в этом тесте и ещё один "
+            "короткий тест после него. Отвечай честно и быстро — первый "
+            "вариант, который откликается, обычно самый точный.\n\n"
+            "Результаты будут переданы рекрутеру."
+        )
+    else:
+        intro = (
+            "Привет! 👋\n\n"
+            "Это короткий тест на твой психотип продавца "
+            "(Красный / Жёлтый / Зелёный / Синий).\n\n"
+            f"Тебя ждёт {TOTAL_QUESTIONS} вопросов, отвечай честно и быстро — "
+            "первый вариант, который откликается, обычно самый точный.\n"
+            "В конце ты узнаешь свои 2 ведущих психотипа.\n\n"
+            "Погнали!"
+        )
     await update.message.reply_text(intro)
     await send_question(update, context, 0)
 
@@ -964,6 +989,22 @@ async def show_motivator_result(query, context: ContextTypes.DEFAULT_TYPE, score
 
     await query.edit_message_text(result_text, parse_mode=ParseMode.HTML, reply_markup=None)
 
+    # Баллы мотиваторов сохраняем сразу — понадобятся и для платного отчёта,
+    # и для отчёта по кандидату.
+    context.user_data["motivator_scores"] = scores
+    context.user_data["m_current_q"] = None
+    context.user_data["m_scores"] = None
+
+    if context.user_data.get("is_candidate"):
+        # Режим оценки кандидата: без оффера и оплаты — полный отчёт уходит
+        # тебе автоматически.
+        await query.message.reply_text(
+            "Спасибо! Ты прошёл(-ла) оценку. Результаты переданы рекрутеру — "
+            "с тобой свяжутся, если подойдёшь."
+        )
+        await send_candidate_report_to_admin(context, disc_scores, scores, query.from_user)
+        return
+
     # Блок "соединения" — только если есть оба результата (обычный порядок
     # прохождения). Если психотип-баллы почему-то отсутствуют (например,
     # прогресс потерялся при перезапуске бота), пропускаем синтез и сразу
@@ -979,12 +1020,6 @@ async def show_motivator_result(query, context: ContextTypes.DEFAULT_TYPE, score
     await query.message.reply_text(
         offer_text, parse_mode=ParseMode.HTML, reply_markup=offer_buttons
     )
-
-    # Баллы мотиваторов сохраняем — понадобятся для полного платного отчёта
-    # вместе с disc_scores (см. format_full_result_text / format_motivator_full_text).
-    context.user_data["motivator_scores"] = scores
-    context.user_data["m_current_q"] = None
-    context.user_data["m_scores"] = None
 
 
 # --------------------------------------------------------------------------
@@ -1242,16 +1277,19 @@ def build_report_prompt(disc_scores: dict, motivator_scores: dict) -> str:
 async def generate_full_report(disc_scores: dict, motivator_scores: dict):
     """Генерирует полный отчёт через Claude API.
 
-    Возвращает кортеж (sections, error_reason):
-      - при успехе: (список из 15 строк содержания, None)
+    Возвращает кортеж (sections, error_reason, elapsed_seconds):
+      - при успехе: (список из 15 строк содержания, None, время в секундах)
       - при любой ошибке или если модель вернула не 15 частей:
-        (None, короткое текстовое описание причины) — вызывающий код
-        подставит фолбэк и покажет причину админу в статусе.
+        (None, короткое текстовое описание причины, время в секундах) —
+        вызывающий код подставит фолбэк и покажет причину и время админу
+        в статусе, чтобы было видно, сколько реально заняла попытка.
     """
+    start = time.monotonic()
+
     if not ANTHROPIC_API_KEY:
         reason = "ANTHROPIC_API_KEY не задан"
         logger.warning("%s — используется склеенный отчёт (фолбэк)", reason)
-        return None, reason
+        return None, reason, time.monotonic() - start
 
     prompt = build_report_prompt(disc_scores, motivator_scores)
 
@@ -1269,8 +1307,9 @@ async def generate_full_report(disc_scores: dict, motivator_scores: dict):
     except Exception as e:
         reason = f"ошибка запроса к Claude API: {e}"
         logger.exception("Не удалось сгенерировать отчёт через Claude API — используется фолбэк")
-        return None, reason
+        return None, reason, time.monotonic() - start
 
+    elapsed = time.monotonic() - start
     sections = [part.strip() for part in raw_text.split(REPORT_SECTION_DELIMITER)]
 
     if len(sections) != len(REPORT_SECTION_TITLES):
@@ -1280,9 +1319,9 @@ async def generate_full_report(disc_scores: dict, motivator_scores: dict):
             len(sections),
             len(REPORT_SECTION_TITLES),
         )
-        return None, reason
+        return None, reason, elapsed
 
-    return sections, None
+    return sections, None, elapsed
 
 
 def format_report_html(sections: list) -> str:
@@ -1404,22 +1443,9 @@ async def handle_confirm_payment(update: Update, context: ContextTypes.DEFAULT_T
     # кнопка зависла.
     await edit_admin_message(query, "⏳ Генерирую отчёт и отправляю... (отчёт стал длиннее, обычно 30-90 секунд, иногда до 2-3 минут)")
 
-    # Пытаемся сгенерировать настоящий синтез через Claude API (список из 15
-    # секций содержания). Если не получилось (нет ключа, ошибка сети, модель
-    # вернула не 15 частей) — подстраховываемся склеенной версией двух
-    # статических полных отчётов, чтобы клиент в любом случае получил
-    # результат. И в том, и в другом случае итоговый текст — валидный HTML
-    # (заголовки жирным мы добавляем сами, содержание экранировано).
-    sections, error_reason = await generate_full_report(disc_scores, motivator_scores)
-    used_fallback = sections is None
-    if sections is None:
-        report_text = (
-            format_full_result_text(disc_scores)
-            + "\n\n"
-            + format_motivator_full_text(motivator_scores)
-        )
-    else:
-        report_text = format_report_html(sections)
+    report_text, elapsed, used_fallback, error_reason = await generate_and_format_report(
+        disc_scores, motivator_scores
+    )
 
     telegram_ok = True
     try:
@@ -1449,9 +1475,61 @@ async def handle_confirm_payment(update: Update, context: ContextTypes.DEFAULT_T
 
     status_lines = [f"✅ Отправлено: {record.get('username') or record.get('full_name') or target_id}"]
     status_lines.append(f"Telegram: {'ok' if telegram_ok else '⚠️ не доставлено (бот заблокирован?)'}")
+    status_lines.append(f"⏱ Время генерации: {elapsed:.0f} сек")
     if used_fallback:
         status_lines.append(f"⚠️ Отправлена склеенная версия ({error_reason})")
     await edit_admin_message(query, "\n".join(status_lines))
+
+
+async def generate_and_format_report(disc_scores: dict, motivator_scores: dict):
+    """Общая логика для платного отчёта и отчёта по кандидату: пытается
+    сгенерировать через Claude API, при неудаче — склеенный фолбэк.
+
+    Возвращает (report_text, elapsed_seconds, used_fallback, error_reason).
+    """
+    sections, error_reason, elapsed = await generate_full_report(disc_scores, motivator_scores)
+    used_fallback = sections is None
+    if sections is None:
+        report_text = (
+            format_full_result_text(disc_scores)
+            + "\n\n"
+            + format_motivator_full_text(motivator_scores)
+        )
+    else:
+        report_text = format_report_html(sections)
+    return report_text, elapsed, used_fallback, error_reason
+
+
+async def send_candidate_report_to_admin(
+    context: ContextTypes.DEFAULT_TYPE, disc_scores: dict, motivator_scores: dict, user
+):
+    """Режим оценки кандидатов: полный отчёт уходит тебе автоматически,
+    бесплатно, без шага оплаты — кандидат его не видит.
+    """
+    if not ADMIN_CHAT_ID:
+        logger.warning(
+            "ADMIN_CHAT_ID не задан — не могу отправить отчёт по кандидату %s", user.id
+        )
+        return
+
+    contact = f"@{user.username}" if user.username else user.full_name
+    await context.bot.send_message(
+        chat_id=ADMIN_CHAT_ID,
+        text=f"🧑‍💼 <b>Оценка кандидата: {contact}</b>\n\n⏳ Генерирую полный отчёт...",
+        parse_mode=ParseMode.HTML,
+    )
+
+    report_text, elapsed, used_fallback, error_reason = await generate_and_format_report(
+        disc_scores, motivator_scores
+    )
+
+    for chunk in split_for_telegram(report_text):
+        await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=chunk, parse_mode=ParseMode.HTML)
+
+    status = f"⏱ Время генерации: {elapsed:.0f} сек"
+    if used_fallback:
+        status += f"\n⚠️ Отправлена склеенная версия ({error_reason})"
+    await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=status)
 
 
 async def edit_admin_message(query, new_text: str):
