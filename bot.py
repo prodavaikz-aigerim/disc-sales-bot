@@ -1240,8 +1240,8 @@ def build_report_prompt(disc_scores: dict, motivator_scores: dict) -> str:
 
 Вот что должно быть внутри каждого раздела:
 
-1. Мой главный портрет — кто этот человек в нескольких словах, что для него важно, где он особенно силён; главная мысль: "не хороший/плохой, а определённый способ действовать". Пиши связным текстом, без списка.
-2. Мои сильные стороны — ровно 3 сильные стороны, ОФОРМИ КАК НУМЕРОВАННЫЙ СПИСОК: "1. [название] — [1-2 предложения с примером, как это проявляется в продажах]", "2. ...", "3. ...", каждый пункт с новой строки.
+1. Мой главный портрет — НЕ указывай проценты или баллы сам, они будут добавлены перед твоим текстом отдельно. Начни сразу с качественного описания: кто этот человек в нескольких словах, что для него важно, где он особенно силён; главная мысль: "не хороший/плохой, а определённый способ действовать". Пиши связным текстом, без списка.
+2. Мои сильные стороны — НЕ указывай проценты или баллы сам, они будут добавлены перед твоим текстом отдельно. Сразу переходи к ровно 3 сильным сторонам, ОФОРМИ КАК НУМЕРОВАННЫЙ СПИСОК: "1. [название] — [1-2 предложения с примером, как это проявляется в продажах]", "2. ...", "3. ...", каждый пункт с новой строки.
 3. Мои зоны риска — ровно 3 зоны риска, ОФОРМИ КАК НУМЕРОВАННЫЙ СПИСОК: "1. [название] — [как именно сильное качество, доведённое до крайности, превращается в риск; как это выглядит со стороны]", "2. ...", "3. ...", каждый пункт с новой строки.
 4. Как я веду себя в продажах — заходи по подпунктам связным текстом (не списком): как входит в контакт с клиентом, как выявляет потребность (какие вопросы задаёт, что может пропускать), как презентует продукт (в чём убедителен, в чём риск), как реагирует на возражения "дорого" / "я подумаю" / "мне нужно посоветоваться".
 5. Как я закрываю продажу — поведение в момент принятия решения клиентом, что даётся легко, что происходит, если клиент долго сомневается. Связным текстом.
@@ -1325,13 +1325,42 @@ async def generate_full_report(disc_scores: dict, motivator_scores: dict):
     return sections, None, elapsed
 
 
-def format_report_html(sections: list) -> str:
+def format_disc_percentage_line(disc_scores: dict) -> str:
+    """Точный процентный расклад по психотипу — считаем сами (не доверяем
+    арифметику модели), от высшего к низшему."""
+    ranked = sorted(disc_scores.items(), key=lambda item: item[1], reverse=True)
+    parts = [
+        f"{PROFILES[code]['emoji']} {PROFILES[code]['name']}: {round(score / TOTAL_QUESTIONS * 100)}%"
+        for code, score in ranked
+    ]
+    return "   ".join(parts)
+
+
+def format_motivator_percentage_line(motivator_scores: dict) -> str:
+    """Точный процентный расклад по кодам мотивации — считаем сами, от высшего к низшему."""
+    ranked = sorted(motivator_scores.items(), key=lambda item: item[1], reverse=True)
+    parts = [
+        f"{MOTIVATOR_PROFILES[code]['emoji']} {MOTIVATOR_PROFILES[code]['name']}: {round(score / 20 * 100)}%"
+        for code, score in ranked
+    ]
+    return "   ".join(parts)
+
+
+def format_report_html(sections: list, disc_scores: dict, motivator_scores: dict) -> str:
     """Собирает финальный HTML-текст отчёта: жирные заголовки с эмодзи (наши,
     гарантированно валидные) + экранированное содержание от модели (защита
     от случайных символов < > &, которые сломали бы разбор Telegram).
+
+    В раздел 1 (портрет) и раздел 2 (сильные стороны) перед текстом модели
+    добавляется точный процентный расклад — по психотипу и по кодам
+    мотивации соответственно, посчитанный в коде, а не моделью.
     """
     blocks = []
     for i, ((emoji, title), body) in enumerate(zip(REPORT_SECTION_TITLES, sections)):
+        if i == 0:
+            body = f"{format_disc_percentage_line(disc_scores)}\n\n{body}"
+        elif i == 1:
+            body = f"{format_motivator_percentage_line(motivator_scores)}\n\n{body}"
         escaped_body = html.escape(body)
         blocks.append(f"<b>{i + 1}. {emoji} {title}</b>\n{escaped_body}")
     return "\n\n".join(blocks)
@@ -1497,7 +1526,7 @@ async def generate_and_format_report(disc_scores: dict, motivator_scores: dict):
             + format_motivator_full_text(motivator_scores)
         )
     else:
-        report_text = format_report_html(sections)
+        report_text = format_report_html(sections, disc_scores, motivator_scores)
     return report_text, elapsed, used_fallback, error_reason
 
 
