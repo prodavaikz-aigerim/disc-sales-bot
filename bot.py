@@ -573,6 +573,30 @@ TOTAL_MOTIVATOR_QUESTIONS = len(MOTIVATOR_QUESTIONS)
 # --------------------------------------------------------------------------
 
 
+def split_text_by_limit(text: str, limit: int) -> list:
+    """Режет текст на части не длиннее limit символов, стараясь резать по
+    границам абзацев (\\n\\n), чтобы не ломать форматирование. Нужно только
+    как страховка от лимита Telegram (4096 символов на сообщение) — в
+    подавляющем большинстве случаев вернёт список из одного элемента.
+    """
+    if len(text) <= limit:
+        return [text]
+
+    parts = []
+    current = ""
+    for paragraph in text.split("\n\n"):
+        candidate = f"{current}\n\n{paragraph}" if current else paragraph
+        if len(candidate) > limit:
+            if current:
+                parts.append(current)
+            current = paragraph
+        else:
+            current = candidate
+    if current:
+        parts.append(current)
+    return parts
+
+
 def build_question_keyboard(qindex: int, options) -> InlineKeyboardMarkup:
     buttons = [
         [InlineKeyboardButton(text=label, callback_data=f"ans|{qindex}|{ptype}")]
@@ -635,6 +659,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     intro_parts = [
         greeting,
+        (
+            "У каждого человека есть потенциал стать сильным продавцом. "
+            "Дело не в «прирождённом таланте» или характере — навыки "
+            "продаж можно развить, если понимать, с чего начать.\n\n"
+            "Вопрос не в том, дан тебе этот навык или нет. Вопрос в том, "
+            "какие твои сильные стороны уже работают на тебя, а какие "
+            "зоны пока проседают и тормозят результат."
+        ),
         (
             "Насколько хорошо ты на самом деле себя понимаешь?\n\n"
             "Наверное, ты ловил(а) себя на мыслях:\n"
@@ -732,9 +764,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ),
     ]
 
-    for part in intro_parts:
-        await update.message.reply_text(part, parse_mode=ParseMode.HTML)
-        await asyncio.sleep(1.2)
+    full_intro = "\n\n".join(intro_parts)
+    for chunk in split_text_by_limit(full_intro, 4096):
+        await update.message.reply_text(chunk, parse_mode=ParseMode.HTML)
 
     start_button = InlineKeyboardMarkup(
         [[InlineKeyboardButton("🚀 Начать тест", callback_data="begin_disc_test")]]
