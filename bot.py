@@ -608,7 +608,15 @@ def build_question_keyboard(qindex: int, options) -> InlineKeyboardMarkup:
 async def send_question(update_or_query, context: ContextTypes.DEFAULT_TYPE, qindex: int):
     question = QUESTIONS[qindex]
     text = f"Вопрос {qindex + 1} из {TOTAL_QUESTIONS}\n\n{question['text']}"
-    keyboard = build_question_keyboard(qindex, question["options"])
+
+    # Перемешиваем порядок вариантов при каждом показе (не сами варианты —
+    # только позицию кнопок). Это защита от невнимательного прохождения
+    # теста, когда человек кликает всегда на одну и ту же позицию кнопки,
+    # не читая варианты — так на выходе не получится искусственно ровного
+    # распределения баллов по всем 4 психотипам.
+    shuffled_options = list(question["options"])
+    random.shuffle(shuffled_options)
+    keyboard = build_question_keyboard(qindex, shuffled_options)
 
     if hasattr(update_or_query, "message") and update_or_query.message is not None:
         # Первый вопрос — обычное сообщение
@@ -1486,6 +1494,52 @@ async def generate_full_report(disc_scores: dict, motivator_scores: dict):
     return sections, None, elapsed
 
 
+def detect_flat_profile_warning(disc_scores: dict, motivator_scores: dict) -> str:
+    """Проверяет, не отвечал ли человек невнимательно / социально желательно
+    (straightlining): слишком ровный профиль DISC или почти максимальные
+    баллы везде в мотиваторах. Возвращает предупреждение для отчёта
+    рекрутеру, либо пустую строку, если всё в порядке.
+    """
+    warnings = []
+
+    if disc_scores:
+        disc_values = list(disc_scores.values())
+        disc_spread = max(disc_values) - min(disc_values)
+        # При 20 вопросах: если разброс между самым частым и самым редким
+        # типом меньше 3 баллов — профиль практически не дифференцирован.
+        if disc_spread <= 2:
+            warnings.append(
+                "по психотипу ответы распределены почти поровну между "
+                "всеми 4 типами (разброс всего "
+                f"{disc_spread} балл(а) из {TOTAL_QUESTIONS})"
+            )
+
+    if motivator_scores:
+        max_per_category = 20  # 4 вопроса × 5 баллов
+        m_values = list(motivator_scores.values())
+        m_spread = max(m_values) - min(m_values)
+        m_avg = sum(m_values) / len(m_values)
+        # Если разброс между категориями маленький И средний балл близок
+        # к максимуму — похоже на "везде максимум".
+        if m_spread <= 3 and m_avg >= max_per_category * 0.85:
+            warnings.append(
+                "по мотиваторам почти во всех категориях баллы близки к "
+                "максимуму — похоже, что кандидат ставил высокие оценки "
+                "везде подряд, не дифференцируя"
+            )
+
+    if not warnings:
+        return ""
+
+    return (
+        "⚠️ <b>Обрати внимание:</b> " + "; ".join(warnings) + ". "
+        "Это может значить, что кандидат отвечал невнимательно или "
+        "старался показаться одинаково сильным во всём. Результату стоит "
+        "доверять с осторожностью — рекомендуется живое интервью для "
+        "проверки."
+    )
+
+
 def format_disc_percentage_line(disc_scores: dict) -> str:
     """Точный процентный расклад по психотипу — считаем сами (не доверяем
     арифметику модели), от высшего к низшему."""
@@ -1709,6 +1763,12 @@ async def send_candidate_report_to_admin(
         text=f"🧑‍💼 <b>Оценка кандидата: {contact}</b>\n\n⏳ Генерирую полный отчёт...",
         parse_mode=ParseMode.HTML,
     )
+
+    flat_profile_warning = detect_flat_profile_warning(disc_scores, motivator_scores)
+    if flat_profile_warning:
+        await context.bot.send_message(
+            chat_id=ADMIN_CHAT_ID, text=flat_profile_warning, parse_mode=ParseMode.HTML
+        )
 
     report_text, elapsed, used_fallback, error_reason = await generate_and_format_report(
         disc_scores, motivator_scores
