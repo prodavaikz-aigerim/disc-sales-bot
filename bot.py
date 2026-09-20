@@ -976,7 +976,10 @@ async def send_motivator_question(query, context: ContextTypes.DEFAULT_TYPE, qin
     shuffled_options = list(question["options"])
     random.shuffle(shuffled_options)
     keyboard = build_motivator_keyboard(qindex, shuffled_options)
-    await query.edit_message_text(text, reply_markup=keyboard)
+    # Отправляем НОВЫМ сообщением (как в DISC-тесте), а не редактируем
+    # предыдущее — только так Telegram проигрывает звук уведомления на
+    # каждый вопрос. Редактирование сообщения звук никогда не даёт.
+    await query.message.reply_text(text, reply_markup=keyboard)
 
 
 async def start_motivators(update: Update, context: ContextTypes.DEFAULT_TYPE):
