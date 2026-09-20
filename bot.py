@@ -53,8 +53,10 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 CHANNEL_URL = os.environ.get("CHANNEL_URL", "https://t.me/your_channel")
 COURSE_URL = os.environ.get("COURSE_URL", "https://your-course-link.example")
+TRAINER_URL = os.environ.get("TRAINER_URL", "https://t.me/AikaSalesGym_bot")
 CHANNEL_BUTTON_TEXT = os.environ.get("CHANNEL_BUTTON_TEXT", "📣 Подписаться на канал")
 COURSE_BUTTON_TEXT = os.environ.get("COURSE_BUTTON_TEXT", "🎓 Записаться на обучение")
+TRAINER_BUTTON_TEXT = os.environ.get("TRAINER_BUTTON_TEXT", "🎯 Попробовать AI-тренажёр бесплатно")
 PERSISTENCE_PATH = os.environ.get("PERSISTENCE_PATH", "bot_persistence.pickle")
 
 # Финальный платный оффер (полный профиль психотипа + код мотивации).
@@ -1184,7 +1186,15 @@ async def show_motivator_result(query, context: ContextTypes.DEFAULT_TYPE, score
 
     offer_text = format_paid_offer_text()
     offer_buttons = InlineKeyboardMarkup(
-        [[InlineKeyboardButton(FULL_REPORT_BUTTON_TEXT, callback_data="request_report")]]
+        [
+            [InlineKeyboardButton(FULL_REPORT_BUTTON_TEXT, callback_data="request_report")],
+            [InlineKeyboardButton(TRAINER_BUTTON_TEXT, url=TRAINER_URL)],
+            [InlineKeyboardButton(CHANNEL_BUTTON_TEXT, url=CHANNEL_URL)],
+            [InlineKeyboardButton(COURSE_BUTTON_TEXT, url=COURSE_URL)],
+        ]
+    )
+    await query.message.reply_text(
+        format_academy_short_teaser(), parse_mode=ParseMode.HTML
     )
     await query.message.reply_text(
         offer_text, parse_mode=ParseMode.HTML, reply_markup=offer_buttons
@@ -1581,6 +1591,18 @@ def format_report_html(sections: list, disc_scores: dict, motivator_scores: dict
     return "\n\n".join(blocks)
 
 
+def format_academy_short_teaser() -> str:
+    """Короткая (в 2 предложения) подводка к каналу и курсу — используется и
+    после обоих тестов (до оплаты), и после оплаты и получения отчёта.
+    """
+    return (
+        "📚 Курс «Профессиональный продавец» — практическое обучение "
+        "продажам, которое уже прошли <b>более 12 000 человек</b>.\n"
+        "📣 Канал — там идёт живая подготовка менеджеров по продажам: "
+        "разборы, техники, кейсы."
+    )
+
+
 def format_academy_cta_text() -> str:
     """Нативная реклама Академии продаж — отправляется отдельным сообщением
     сразу после полного отчёта в Telegram.
@@ -1701,16 +1723,16 @@ async def handle_confirm_payment(update: Update, context: ContextTypes.DEFAULT_T
         for chunk in split_for_telegram(report_text):
             await context.bot.send_message(chat_id=target_id, text=chunk, parse_mode=ParseMode.HTML)
 
-        academy_cta_text = format_academy_cta_text()
         academy_buttons = InlineKeyboardMarkup(
             [
+                [InlineKeyboardButton(TRAINER_BUTTON_TEXT, url=TRAINER_URL)],
                 [InlineKeyboardButton(CHANNEL_BUTTON_TEXT, url=CHANNEL_URL)],
                 [InlineKeyboardButton(COURSE_BUTTON_TEXT, url=COURSE_URL)],
             ]
         )
         await context.bot.send_message(
             chat_id=target_id,
-            text=academy_cta_text,
+            text=format_academy_short_teaser(),
             parse_mode=ParseMode.HTML,
             reply_markup=academy_buttons,
         )
@@ -1876,22 +1898,31 @@ def format_result_text(scores: dict) -> str:
 
 
 def format_bridge_to_motivators_text() -> str:
-    """Короткое сообщение-мостик после DISC — приглашение ко второму тесту.
-
-    Раньше здесь был длинный список вопросов + пример слепого пятна —
-    теперь этот контент переехал в format_paid_offer_text(), потому что
-    появился отдельный шаг "соединения" между двумя тестами (см.
-    build_synthesis_text) и он сам по себе достаточно сильный крючок.
+    """Продающий мостик после DISC — объясняет ЦЕННОСТЬ второго теста, а не
+    просто анонсирует его существование, чтобы мотивировать пройти его до
+    конца, а не бросить на середине.
     """
     lines = [
-        "Ты узнал(а), <b>КАК</b> ты ведёшь себя в продажах.",
+        "Ты узнал(а), <b>КАК</b> ты ведёшь себя в продажах и в жизни.",
         "",
-        "Но пока мы не знаем:",
-        "💰 что именно заставляет тебя действовать и зарабатывать;",
-        "🔥 что тебя включает и заряжает;",
-        "🚫 что тебя демотивирует.",
+        (
+            "Но за любым поведением стоит причина — то, что тобой реально "
+            "движет. Мотиваторы отвечают на вопрос <b>ПОЧЕМУ</b>, и часто "
+            "именно там кроются ответы на вопросы, которые давно не дают "
+            "покоя:"
+        ),
         "",
-        "Чтобы это узнать, пройди второй мини-тест — «Твой код мотивации в деньгах».",
+        "— почему одни задачи заряжают, а другие выматывают без причины;",
+        "— почему в одних ситуациях всё легко, а в других — постоянное сопротивление;",
+        "— откуда берутся одни и те же проблемы, которые повторяются снова и снова.",
+        "",
+        (
+            "Зная свой код мотивации, ты видишь, что конкретно стоит "
+            "изменить, чтобы стать сильнее и заметно улучшить результат — "
+            "не через силу воли, а через понимание себя."
+        ),
+        "",
+        "Пройди второй мини-тест — «Твой код мотивации» — это займёт всего пару минут.",
     ]
     return "\n".join(lines)
 
@@ -1951,8 +1982,6 @@ async def show_result(query, context: ContextTypes.DEFAULT_TYPE, scores: dict):
     cta_buttons = InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("💰 Узнать свой код мотивации", callback_data="start_motivators")],
-            [InlineKeyboardButton(CHANNEL_BUTTON_TEXT, url=CHANNEL_URL)],
-            [InlineKeyboardButton(COURSE_BUTTON_TEXT, url=COURSE_URL)],
         ]
     )
 
